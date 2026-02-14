@@ -1,0 +1,1613 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>桃太郎RPG 〜鬼退治の旅〜</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#111;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+body{display:flex;justify-content:center;align-items:center}
+canvas{display:block;image-rendering:pixelated}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ═══════════════════════════════════════
+// CANVAS SETUP
+// ═══════════════════════════════════════
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 480, H = 720;
+canvas.width = W; canvas.height = H;
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+resize(); addEventListener('resize', resize);
+
+// ═══════════════════════════════════════
+// AUDIO
+// ═══════════════════════════════════════
+let audioCtx = null;
+function ensureAudio() { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+
+function playNote(freq, dur, type, vol, time) {
+  if (!audioCtx) return;
+  const t = time || audioCtx.currentTime;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type || 'square';
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(vol || 0.08, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(t); o.stop(t + dur);
+}
+
+function midi2freq(n) { return 440 * Math.pow(2, (n - 69) / 12); }
+
+function seAttack() { ensureAudio(); playNote(200, 0.08, 'square', 0.1); setTimeout(() => playNote(150, 0.1, 'noise' === 'noise' ? 'sawtooth' : 'square', 0.08), 40); }
+function seHit() { ensureAudio(); playNote(100, 0.15, 'sawtooth', 0.1); }
+function seCursor() { ensureAudio(); playNote(880, 0.05, 'square', 0.05); }
+function seConfirm() { ensureAudio(); playNote(660, 0.08, 'square', 0.06); setTimeout(() => playNote(880, 0.1, 'square', 0.06), 60); }
+function seCancel() { ensureAudio(); playNote(330, 0.1, 'square', 0.05); }
+function seHeal() { ensureAudio(); [0,60,120,180].forEach((t,i) => setTimeout(() => playNote(440+i*110, 0.15, 'sine', 0.08), t)); }
+function seLevelUp() { ensureAudio(); [0,80,160,240,320].forEach((t,i) => setTimeout(() => playNote(523+i*80, 0.15, 'square', 0.08), t)); }
+function seRecruit() { ensureAudio(); [0,100,200,300,400,500].forEach((t,i) => setTimeout(() => playNote(440+i*60, 0.2, 'sine', 0.1), t)); }
+function seVictory() { ensureAudio(); const ns=[60,64,67,72,67,72,76,72]; ns.forEach((n,i)=>setTimeout(()=>playNote(midi2freq(n),0.2,'square',0.08),i*120)); }
+function seBossDefeat() { ensureAudio(); const ns=[60,63,67,70,72,75,79,84]; ns.forEach((n,i)=>setTimeout(()=>playNote(midi2freq(n),0.3,'square',0.1),i*150)); }
+
+// ═══════════════════════════════════════
+// BGM SYSTEM
+// ═══════════════════════════════════════
+let bgmTimer = null, bgmName = '';
+const BGMS = {
+  village: { bpm: 110, wave: 'sine', vol: 0.06, notes: [62,65,69,72,69,65,62,60,57,60,62,65,69,72,74,72] },
+  field: { bpm: 140, wave: 'square', vol: 0.05, notes: [57,60,62,64,67,64,62,60,57,55,52,55,57,60,64,62] },
+  battle: { bpm: 180, wave: 'square', vol: 0.06, notes: [45,57,52,57,48,60,55,60,45,57,52,57,50,62,57,62] },
+  boss: { bpm: 150, wave: 'sawtooth', vol: 0.06, notes: [33,45,36,48,33,45,40,52,33,45,36,48,38,50,41,53] },
+};
+let bgmIdx = 0;
+function playBGM(name) {
+  if (bgmName === name) return;
+  stopBGM(); bgmName = name;
+  if (!audioCtx || !BGMS[name]) return;
+  const b = BGMS[name]; bgmIdx = 0;
+  const step = 60000 / b.bpm / 2;
+  bgmTimer = setInterval(() => {
+    if (!audioCtx) return;
+    const n = b.notes[bgmIdx % b.notes.length];
+    if (n > 0) playNote(midi2freq(n), step/1000*0.8, b.wave, b.vol);
+    playNote(midi2freq(n - 24), step/1000*0.9, 'triangle', b.vol * 0.7);
+    bgmIdx++;
+  }, step);
+}
+function stopBGM() { if (bgmTimer) { clearInterval(bgmTimer); bgmTimer = null; } bgmName = ''; }
+
+// ═══════════════════════════════════════
+// INPUT
+// ═══════════════════════════════════════
+const input = { up:false, down:false, left:false, right:false, a:false, b:false };
+const inputPrev = { a:false, b:false, up:false, down:false, left:false, right:false };
+const inputPressed = { a:false, b:false, up:false, down:false, left:false, right:false };
+const keys = {};
+
+document.addEventListener('keydown', e => { keys[e.code] = true; ensureAudio(); e.preventDefault(); });
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function updateInput() {
+  for (const k of ['a','b','up','down','left','right']) inputPrev[k] = input[k];
+  input.up = !!(keys.ArrowUp || keys.KeyW || touchState.up);
+  input.down = !!(keys.ArrowDown || keys.KeyS || touchState.down);
+  input.left = !!(keys.ArrowLeft || keys.KeyA || touchState.left);
+  input.right = !!(keys.ArrowRight || keys.KeyD || touchState.right);
+  input.a = !!(keys.KeyZ || keys.Space || keys.Enter || touchState.a);
+  input.b = !!(keys.KeyX || keys.Escape || keys.ShiftLeft || touchState.b);
+  for (const k of ['a','b','up','down','left','right']) inputPressed[k] = input[k] && !inputPrev[k];
+}
+
+// Touch
+const touchState = { up:false, down:false, left:false, right:false, a:false, b:false };
+const DPAD_X = 90, DPAD_Y = H - 110, DPAD_R = 55;
+const ABTN_X = W - 75, ABTN_Y = H - 90, ABTN_R = 32;
+const BBTN_X = W - 145, BBTN_Y = H - 110, BBTN_R = 26;
+
+function handleTouch(e) {
+  e.preventDefault(); ensureAudio();
+  const rect = canvas.getBoundingClientRect();
+  const sx = W / rect.width, sy = H / rect.height;
+  touchState.up = touchState.down = touchState.left = touchState.right = false;
+  touchState.a = touchState.b = false;
+  for (const t of e.touches) {
+    const tx = (t.clientX - rect.left) * sx, ty = (t.clientY - rect.top) * sy;
+    const dx = tx - DPAD_X, dy = ty - DPAD_Y;
+    if (Math.abs(dx) < DPAD_R + 20 && Math.abs(dy) < DPAD_R + 20) {
+      if (Math.abs(dx) > Math.abs(dy)) { if (dx < 0) touchState.left = true; else touchState.right = true; }
+      else { if (dy < 0) touchState.up = true; else touchState.down = true; }
+    }
+    if (Math.hypot(tx - ABTN_X, ty - ABTN_Y) < ABTN_R + 10) touchState.a = true;
+    if (Math.hypot(tx - BBTN_X, ty - BBTN_Y) < BBTN_R + 10) touchState.b = true;
+  }
+}
+function handleTouchEnd(e) {
+  e.preventDefault();
+  if (e.touches.length === 0) {
+    for (const k of ['up','down','left','right','a','b']) touchState[k] = false;
+  } else handleTouch(e);
+}
+canvas.addEventListener('touchstart', handleTouch, {passive:false});
+canvas.addEventListener('touchmove', handleTouch, {passive:false});
+canvas.addEventListener('touchend', handleTouchEnd, {passive:false});
+canvas.addEventListener('touchcancel', handleTouchEnd, {passive:false});
+
+// ═══════════════════════════════════════
+// GAME STATE
+// ═══════════════════════════════════════
+let gameState = 'title'; // title,prologue,map,dialog,battle,menu,transition,ending,gameover
+let globalTime = 0;
+const flags = {};
+let currentMap = 'village';
+let fadeAlpha = 0, fadeDir = 0, fadeCallback = null;
+
+// Party
+const CHAR_BASE = {
+  momotaro: { name:'桃太郎', hp:35, maxHp:35, mp:5, maxMp:5, atk:10, def:8, spd:7, exp:0, level:1, skillName:'桃斬り', skillCost:3, skillMult:1.5 },
+  dog:      { name:'犬',     hp:28, maxHp:28, mp:3, maxMp:3, atk:9,  def:6, spd:9, exp:0, level:2, skillName:'かみつき', skillCost:2, skillMult:1.4 },
+  monkey:   { name:'猿',     hp:25, maxHp:25, mp:8, maxMp:8, atk:7,  def:5, spd:8, exp:0, level:3, skillName:'身軽な技', skillCost:3, skillMult:0.8, hits:2 },
+  pheasant: { name:'雉',     hp:22, maxHp:22, mp:10,maxMp:10,atk:6,  def:4, spd:12,exp:0, level:4, skillName:'疾風',     skillCost:4, skillMult:0.7, aoe:true },
+};
+const LEVEL_GAINS = {
+  momotaro: {hp:8,mp:2,atk:3,def:2,spd:2}, dog:{hp:6,mp:1,atk:2,def:2,spd:3},
+  monkey:{hp:5,mp:3,atk:2,def:1,spd:2}, pheasant:{hp:4,mp:3,atk:2,def:1,spd:3},
+};
+let party = []; // array of character objects (cloned from CHAR_BASE)
+let inventory = [];
+
+function initParty() {
+  party = [Object.assign({}, CHAR_BASE.momotaro, {id:'momotaro'})];
+  inventory = [{id:'kibidango',name:'きびだんご',heal:20,count:3},{id:'momonomi',name:'桃の実',heal:50,count:0}];
+}
+
+function addPartyMember(id) {
+  const c = Object.assign({}, CHAR_BASE[id], {id});
+  party.push(c);
+}
+
+function levelUp(ch) {
+  ch.level++;
+  const g = LEVEL_GAINS[ch.id];
+  ch.maxHp += g.hp; ch.hp = ch.maxHp;
+  ch.maxMp += g.mp; ch.mp = ch.maxMp;
+  ch.atk += g.atk; ch.def += g.def; ch.spd += g.spd;
+}
+
+// Player position
+let player = { x: 5, y: 5, dir: 0, frame: 0, moving: false, moveT: 0, fromX: 0, fromY: 0 };
+let stepCount = 0;
+
+// ═══════════════════════════════════════
+// TILES
+// ═══════════════════════════════════════
+const TS = 32;
+const TILE_INFO = {
+  '.': {bg:'#4a4',walk:true,enc:true},   '~': {bg:'#36a',walk:false},
+  '#': {bg:'#b97',walk:true,enc:false},   'T': {bg:'#285',walk:false},
+  'W': {bg:'#777',walk:false},            'R': {bg:'#a44',walk:false},
+  'D': {bg:'#853',walk:true,enc:false},   'S': {bg:'#da8',walk:true,enc:true},
+  'C': {bg:'#aa0',walk:true,enc:false},   'M': {bg:'#665',walk:false},
+  'B': {bg:'#a86',walk:true,enc:false},   'F': {bg:'#5a5',walk:true,enc:false},
+  'G': {bg:'#374',walk:true,enc:true},    'L': {bg:'#d42',walk:false},
+  'P': {bg:'#4a4',walk:false},            'E': {bg:'#555',walk:true,enc:false},
+  'K': {bg:'#b97',walk:true,enc:false},
+};
+
+function drawTile(type, sx, sy) {
+  const t = TILE_INFO[type];
+  if (!t) { ctx.fillStyle = '#000'; ctx.fillRect(sx, sy, TS, TS); return; }
+  ctx.fillStyle = t.bg;
+  ctx.fillRect(sx, sy, TS, TS);
+  // Details
+  if (type === '.' || type === 'F' || type === 'G') {
+    ctx.fillStyle = type === 'G' ? '#2a5' : '#3a3';
+    for (let i = 0; i < 3; i++) ctx.fillRect(sx+5+i*9, sy+8+((i*7)%12), 2, 2);
+    if (type === 'F') { ctx.fillStyle = '#f8f'; ctx.fillRect(sx+6,sy+4,3,3); ctx.fillStyle = '#ff8'; ctx.fillRect(sx+18,sy+14,3,3); }
+  }
+  if (type === '~') {
+    ctx.fillStyle = '#48c';
+    const off = (globalTime * 2 + sx * 0.1) % 6;
+    ctx.fillRect(sx+4+off, sy+8, 8, 2); ctx.fillRect(sx+14-off, sy+20, 10, 2);
+  }
+  if (type === 'T') {
+    ctx.fillStyle = '#653'; ctx.fillRect(sx+13, sy+16, 6, 16);
+    ctx.fillStyle = '#2a5'; ctx.fillRect(sx+4, sy+2, 24, 18);
+    ctx.fillStyle = '#3b6'; ctx.fillRect(sx+8, sy+4, 16, 10);
+  }
+  if (type === 'W') {
+    ctx.fillStyle = '#666'; ctx.fillRect(sx, sy+15, TS, 2);
+    ctx.fillStyle = '#888'; ctx.fillRect(sx+15, sy, 2, TS);
+  }
+  if (type === 'R') { ctx.fillStyle = '#c55'; for (let i = 0; i < 4; i++) ctx.fillRect(sx, sy+i*8, TS, 4); }
+  if (type === 'P') {
+    ctx.fillStyle = '#4a4'; ctx.fillRect(sx, sy, TS, TS);
+    ctx.fillStyle = '#863'; ctx.fillRect(sx+12, sy+10, 8, 20);
+    ctx.fillStyle = '#a85'; ctx.fillRect(sx+6, sy+4, 20, 14);
+  }
+  if (type === 'C') {
+    ctx.fillStyle = '#4a4'; ctx.fillRect(sx, sy, TS, TS);
+    ctx.fillStyle = '#a80'; ctx.fillRect(sx+8, sy+12, 16, 14);
+    ctx.fillStyle = '#dc0'; ctx.fillRect(sx+10, sy+14, 12, 10);
+    ctx.fillStyle = '#a80'; ctx.fillRect(sx+8, sy+18, 16, 2);
+  }
+  if (type === 'M') { ctx.fillStyle = '#776'; ctx.fillRect(sx+4,sy+8,24,24); ctx.fillStyle = '#887'; ctx.fillRect(sx+8,sy+2,16,20); ctx.fillStyle = '#998'; ctx.fillRect(sx+12,sy,8,10); }
+  if (type === 'B') { ctx.fillStyle = '#36a'; ctx.fillRect(sx,sy,TS,TS); ctx.fillStyle = '#a86'; for(let i=0;i<4;i++) ctx.fillRect(sx,sy+i*8,TS,6); }
+  if (type === 'S') { ctx.fillStyle = '#c96'; ctx.fillRect(sx+5,sy+10,2,2); ctx.fillRect(sx+20,sy+22,2,2); }
+  if (type === 'L') { ctx.fillStyle = '#f84'; const fl=Math.sin(globalTime*3+sx)*3; ctx.fillRect(sx+6+fl,sy+4,8,4); ctx.fillRect(sx+16-fl,sy+18,8,4); }
+  if (type === 'K') { ctx.fillStyle = '#975'; ctx.fillRect(sx,sy+12,TS,4); ctx.fillRect(sx,sy+24,TS,4); }
+}
+
+// ═══════════════════════════════════════
+// MAP DATA
+// ═══════════════════════════════════════
+const MAPS = {
+  village: {
+    w: 20, h: 16,
+    data: [
+      'TTTTTTTTTTTTTTTTTTTT',
+      'TF.............F..TT',
+      'T.RRR......RRR....TT',
+      'T.WDW......WDW....TT',
+      'T..................T',
+      'T.....F............T',
+      'T.....P............T',
+      'T..................T',
+      'T.............RRR..T',
+      'T.............WDW..T',
+      'T..................T',
+      'T..F...........F...T',
+      'T..................T',
+      'T........##........T',
+      'T........##........T',
+      'TTTTTTTT##TTTTTTTTTT',
+    ],
+    npcs: [
+      {x:4,y:4,name:'おじいさん',sprite:'grandpa',dir:0,id:'grandpa'},
+      {x:11,y:4,name:'おばあさん',sprite:'grandma',dir:0,id:'grandma'},
+      {x:6,y:8,name:'村人',sprite:'villager',dir:0,id:'villager1'},
+    ],
+    encounters: [],
+    transitions: [{x:8,y:15,to:'forest',tx:10,ty:1},{x:9,y:15,to:'forest',tx:11,ty:1}],
+    spawn: {x:3,y:3},
+    bgm: 'village',
+  },
+  forest: {
+    w: 22, h: 18,
+    data: [
+      'TTTTTTTTTT##TTTTTTTTTT',
+      'TGG..##..GGGG..##..GTT',
+      'TG...##..GGGG..##..GTT',
+      'TGG..##..GGGG..##.GGTT',
+      'TGGG.##.GGGGG..##GGGTT',
+      'TGG.....GGGGG.....GGTT',
+      'TG..GGG..GG...GGG.GGTT',
+      'TGG.GGGG.GG..GGGG.GGTT',
+      'TG..GGGG......GGGG.GTT',
+      'TG...GGG......GGG..GTT',
+      'TGG.GGGG.GG..GGGG.GGTT',
+      'TG..GGG..GG...GGG.GGTT',
+      'TGG.....GGGGG.....GGTT',
+      'TGGG.##.GGGGG..##GGGTT',
+      'TGG..##..GGGG..##.GGTT',
+      'TG...##..GGGG..##..GTT',
+      'TGG..##..GGGG..##..GTT',
+      'TTTTTTTTTT##TTTTTTTTTT'
+    ],
+    npcs: [{x:17,y:9,name:'犬',sprite:'dog',dir:2,id:'dog_npc',flag:'!hasDog'}],
+    encounters: [{enemies:['tanuki'],w:3},{enemies:['kooni'],w:2},{enemies:['tanuki','tanuki'],w:1}],
+    transitions: [{x:10,y:0,to:'village',tx:8,ty:14},{x:11,y:0,to:'village',tx:9,ty:14},{x:10,y:17,to:'mountain',tx:10,ty:1},{x:11,y:17,to:'mountain',tx:11,ty:1}],
+    spawn: {x:10,y:1},
+    bgm: 'field',
+  },
+  mountain: {
+    w: 22, h: 20,
+    data: [
+      'MMMMMMMMMM##MMMMMMMMMM',
+      'M.....##.......##...MM',
+      'M.MMM.##.MMMMM.##.MMMM',
+      'M.MMM.##.M...M.##.MMMM',
+      'M.....##.M.M.M.##...MM',
+      'MMMMM.##.M.M.M.##.MMMM',
+      'M.....##..MM...##...MM',
+      'M.##############....MM',
+      'M.##..MMMMMM..##.MM.MM',
+      'M.##...........##...MM',
+      'M.##..MMMM.MMMM##..MMM',
+      'M.##..M.......M.##.MMM',
+      'M.##..M.MMMMM.M.##..MM',
+      'M.....M.......M..##.MM',
+      'MMMMMMMM.##.MMMM.##.MM',
+      'M........##......##..M',
+      'M.MMMMM..##.MMMMM##.MM',
+      'M........##......##..M',
+      'M........##......##..M',
+      'MMMMMMMMMM##MMMMMMMMMM'
+    ],
+    npcs: [{x:10,y:9,name:'猿',sprite:'monkey',dir:0,id:'monkey_npc',flag:'!hasMonkey'}],
+    encounters: [{enemies:['tengu'],w:2},{enemies:['yamaoni'],w:2},{enemies:['iwanaga'],w:2},{enemies:['yamaoni','tengu'],w:1}],
+    transitions: [{x:10,y:0,to:'forest',tx:10,ty:16},{x:11,y:0,to:'forest',tx:11,ty:16},{x:10,y:19,to:'beach',tx:9,ty:1},{x:11,y:19,to:'beach',tx:10,ty:1}],
+    spawn: {x:10,y:1},
+    bgm: 'field',
+  },
+  beach: {
+    w: 20, h: 14,
+    data: [
+      'TTTTTTTTT##TTTTTTTTT',
+      'T........##........T',
+      'T..F.....##....F...T',
+      'T........##........T',
+      'SSSSSSSSSSSSSSSSSSSS',
+      'SSSSSSSSSSSSSSSSSSSS',
+      'SSSS.SSSSSSSSS.SSSSS',
+      'SSS...SSSSSSS...SSSS',
+      'SS.....SSSSS.....SSS',
+      '~~~~~~BBBBB~~~~~~~~~',
+      '~~~~~~~~~~~~~~~~~~~~',
+      '~~~~~~~~~~~~~~~~~~~~',
+      '~~~~~~~~~KK~~~~~~~~~',
+      '~~~~~~~~~KK~~~~~~~~~'
+    ],
+    npcs: [{x:5,y:7,name:'雉',sprite:'pheasant',dir:0,id:'pheasant_npc',flag:'!hasPheasant'}],
+    encounters: [{enemies:['kappa'],w:3},{enemies:['kanimusha'],w:2},{enemies:['kappa','kappa'],w:1}],
+    transitions: [{x:9,y:0,to:'mountain',tx:10,ty:18},{x:10,y:0,to:'mountain',tx:11,ty:18},{x:9,y:13,to:'onigashima',tx:9,ty:2},{x:10,y:13,to:'onigashima',tx:10,ty:2}],
+    spawn: {x:9,y:1},
+    bgm: 'field',
+  },
+  onigashima: {
+    w: 20, h: 20,
+    data: [
+      'MMMMMMMMM##MMMMMMMMM',
+      'M~~~~~~~~KK~~~~~~~~M',
+      'MLLL.....##....LLLMM',
+      'M........##........M',
+      'M.MMMM...##..MMMM.MM',
+      'M........##........M',
+      'M..####..##..####..M',
+      'M........##........M',
+      'M.MMMM...##..MMMM.MM',
+      'M........##........M',
+      'M..MMMM..##..MMMM.MM',
+      'M........##........M',
+      'M.MMMM...##..MMMM.MM',
+      'M........##........M',
+      'M..LLL...##..LLL...M',
+      'M........##........M',
+      'M..MMMM..##..MMMM.MM',
+      'M........##........M',
+      'M........##........M',
+      'M........##........M'
+    ],
+    npcs: [{x:9,y:18,name:'鬼大将',sprite:'boss',dir:0,id:'boss_npc',flag:'!bossDefeated'}],
+    encounters: [{enemies:['onihei'],w:3},{enemies:['onijutsu'],w:2},{enemies:['onihei','onijutsu'],w:1}],
+    transitions: [{x:9,y:0,to:'beach',tx:9,ty:12},{x:10,y:0,to:'beach',tx:10,ty:12}],
+    spawn: {x:9,y:2},
+    bgm: 'boss',
+  },
+};
+
+// ═══════════════════════════════════════
+// ENEMIES
+// ═══════════════════════════════════════
+const ENEMIES = {
+  tanuki:   {name:'たぬき',   hp:12, atk:5,  def:3,  spd:4,  exp:6,  gold:3, color:'#a85'},
+  kooni:    {name:'子鬼',     hp:18, atk:8,  def:4,  spd:5,  exp:9,  gold:5, color:'#c66'},
+  tengu:    {name:'天狗',     hp:25, atk:12, def:6,  spd:8,  exp:14, gold:8, color:'#c44'},
+  yamaoni:  {name:'山鬼',     hp:30, atk:14, def:8,  spd:4,  exp:16, gold:10,color:'#a55'},
+  iwanaga:  {name:'岩蛇',     hp:22, atk:10, def:12, spd:3,  exp:12, gold:7, color:'#887'},
+  kappa:    {name:'河童',     hp:28, atk:11, def:7,  spd:9,  exp:15, gold:9, color:'#4a6'},
+  kanimusha:{name:'蟹武者',   hp:35, atk:15, def:14, spd:5,  exp:20, gold:12,color:'#c55'},
+  onihei:   {name:'鬼兵',     hp:40, atk:18, def:10, spd:7,  exp:24, gold:15,color:'#66a'},
+  onijutsu: {name:'鬼術師',   hp:30, atk:22, def:6,  spd:10, exp:28, gold:18,color:'#a6c'},
+  boss:     {name:'鬼大将',   hp:180,atk:25, def:12, spd:6,  exp:100,gold:0, color:'#e33', isBoss:true},
+};
+
+// ═══════════════════════════════════════
+// SPRITE DRAWING
+// ═══════════════════════════════════════
+function drawCharSprite(name, sx, sy, dir, frame, scale) {
+  const sc = scale || 1;
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.scale(sc, sc);
+  if (dir === 3) ctx.scale(-1, 1); // right = flip left
+  const funcs = {
+    momotaro: drawMomotaro, dog: drawDog, monkey: drawMonkey, pheasant: drawPheasant,
+    grandpa: drawGrandpa, grandma: drawGrandma, villager: drawVillager, boss: drawBossSprite,
+  };
+  (funcs[name] || drawVillager)(dir, frame);
+  ctx.restore();
+}
+
+function drawMomotaro(dir, frame) {
+  // Hair
+  ctx.fillStyle = '#542'; ctx.fillRect(-6, -30, 12, 5);
+  // Headband
+  ctx.fillStyle = '#e22'; ctx.fillRect(-7, -26, 14, 3);
+  // Face
+  ctx.fillStyle = '#fca'; ctx.fillRect(-5, -23, 10, 9);
+  // Eyes
+  if (dir !== 2) { ctx.fillStyle = '#222'; ctx.fillRect(-3, -20, 2, 2); ctx.fillRect(1, -20, 2, 2); }
+  // Body
+  ctx.fillStyle = '#f8a'; ctx.fillRect(-6, -14, 12, 10);
+  // Belt
+  ctx.fillStyle = '#c66'; ctx.fillRect(-6, -8, 12, 2);
+  // Legs
+  ctx.fillStyle = '#d78';
+  const lo = frame ? 2 : 0;
+  ctx.fillRect(-4+lo, -4, 3, 6); ctx.fillRect(1-lo, -4, 3, 6);
+  // Feet
+  ctx.fillStyle = '#864'; ctx.fillRect(-5+lo, 2, 4, 3); ctx.fillRect(0-lo, 2, 4, 3);
+}
+
+function drawDog(dir, frame) {
+  // Body
+  ctx.fillStyle = '#a75'; ctx.fillRect(-6, -18, 12, 12);
+  // Head
+  ctx.fillStyle = '#c96'; ctx.fillRect(-5, -26, 10, 10);
+  // Ears
+  ctx.fillStyle = '#864'; ctx.fillRect(-7, -28, 4, 6); ctx.fillRect(3, -28, 4, 6);
+  // Bandana
+  ctx.fillStyle = '#48f'; ctx.fillRect(-6, -18, 12, 3);
+  // Eyes
+  if (dir !== 2) { ctx.fillStyle = '#222'; ctx.fillRect(-3, -22, 2, 2); ctx.fillRect(1, -22, 2, 2); }
+  // Nose
+  ctx.fillStyle = '#222'; ctx.fillRect(-1, -19, 2, 2);
+  // Legs
+  ctx.fillStyle = '#a75';
+  const lo = frame ? 2 : 0;
+  ctx.fillRect(-4+lo, -6, 3, 8); ctx.fillRect(1-lo, -6, 3, 8);
+  ctx.fillStyle = '#864'; ctx.fillRect(-4+lo, 2, 3, 3); ctx.fillRect(1-lo, 2, 3, 3);
+}
+
+function drawMonkey(dir, frame) {
+  // Body
+  ctx.fillStyle = '#a64'; ctx.fillRect(-6, -18, 12, 12);
+  // Vest
+  ctx.fillStyle = '#4a4'; ctx.fillRect(-6, -18, 3, 10); ctx.fillRect(3, -18, 3, 10);
+  // Head
+  ctx.fillStyle = '#c86'; ctx.fillRect(-5, -26, 10, 10);
+  // Face
+  ctx.fillStyle = '#fca'; ctx.fillRect(-3, -22, 6, 6);
+  // Eyes
+  if (dir !== 2) { ctx.fillStyle = '#222'; ctx.fillRect(-2, -21, 2, 2); ctx.fillRect(1, -21, 2, 2); }
+  // Ears
+  ctx.fillStyle = '#c86'; ctx.fillRect(-7, -22, 3, 4); ctx.fillRect(4, -22, 3, 4);
+  // Legs
+  ctx.fillStyle = '#a64';
+  const lo = frame ? 2 : 0;
+  ctx.fillRect(-4+lo, -6, 3, 8); ctx.fillRect(1-lo, -6, 3, 8);
+  ctx.fillStyle = '#864'; ctx.fillRect(-4+lo, 2, 3, 3); ctx.fillRect(1-lo, 2, 3, 3);
+}
+
+function drawPheasant(dir, frame) {
+  // Body
+  ctx.fillStyle = '#4a8'; ctx.fillRect(-5, -16, 10, 12);
+  // Wing
+  ctx.fillStyle = '#3a7'; ctx.fillRect(-7, -14, 4, 8); ctx.fillRect(3, -14, 4, 8);
+  // Head
+  ctx.fillStyle = '#4a8'; ctx.fillRect(-4, -24, 8, 10);
+  // Crest
+  ctx.fillStyle = '#e33'; ctx.fillRect(-2, -28, 4, 5);
+  // Beak
+  ctx.fillStyle = '#da0'; ctx.fillRect(-1, -18, 3, 3);
+  // Eyes
+  if (dir !== 2) { ctx.fillStyle = '#222'; ctx.fillRect(-2, -22, 2, 2); ctx.fillRect(1, -22, 2, 2); }
+  // Legs
+  ctx.fillStyle = '#da0';
+  const lo = frame ? 1 : 0;
+  ctx.fillRect(-2+lo, -4, 2, 8); ctx.fillRect(1-lo, -4, 2, 8);
+}
+
+function drawGrandpa(dir, frame) {
+  ctx.fillStyle = '#888'; ctx.fillRect(-5, -28, 10, 5);
+  ctx.fillStyle = '#fca'; ctx.fillRect(-5, -23, 10, 8);
+  if (dir !== 2) { ctx.fillStyle = '#222'; ctx.fillRect(-3, -20, 2, 2); ctx.fillRect(1, -20, 2, 2); }
+  ctx.fillStyle = '#558'; ctx.fillRect(-6, -15, 12, 12);
+  ctx.fillStyle = '#446'; ctx.fillRect(-4, -3, 3, 6); ctx.fillRect(1, -3, 3, 6);
+  ctx.fillStyle = '#864'; ctx.fillRect(-4, 3, 3, 2); ctx.fillRect(1, 3, 3, 2);
+}
+
+function drawGrandma(dir, frame) {
+  ctx.fillStyle = '#fff'; ctx.fillRect(-5, -28, 10, 5);
+  ctx.fillStyle = '#fca'; ctx.fillRect(-5, -23, 10, 8);
+  if (dir !== 2) { ctx.fillStyle = '#222'; ctx.fillRect(-3, -20, 2, 2); ctx.fillRect(1, -20, 2, 2); }
+  ctx.fillStyle = '#a5a'; ctx.fillRect(-6, -15, 12, 14);
+  ctx.fillStyle = '#858'; ctx.fillRect(-4, -1, 3, 4); ctx.fillRect(1, -1, 3, 4);
+  ctx.fillStyle = '#864'; ctx.fillRect(-4, 3, 3, 2); ctx.fillRect(1, 3, 3, 2);
+}
+
+function drawVillager(dir, frame) {
+  ctx.fillStyle = '#654'; ctx.fillRect(-5, -28, 10, 5);
+  ctx.fillStyle = '#fca'; ctx.fillRect(-5, -23, 10, 8);
+  if (dir !== 2) { ctx.fillStyle = '#222'; ctx.fillRect(-3, -20, 2, 2); ctx.fillRect(1, -20, 2, 2); }
+  ctx.fillStyle = '#786'; ctx.fillRect(-6, -15, 12, 12);
+  ctx.fillStyle = '#675'; ctx.fillRect(-4, -3, 3, 6); ctx.fillRect(1, -3, 3, 6);
+  ctx.fillStyle = '#864'; ctx.fillRect(-4, 3, 3, 2); ctx.fillRect(1, 3, 3, 2);
+}
+
+function drawBossSprite(dir, frame) {
+  // Large boss - drawn at normal scale, caller handles sizing
+  ctx.fillStyle = '#e33'; ctx.fillRect(-8, -30, 16, 14);
+  // Horns
+  ctx.fillStyle = '#da0'; ctx.fillRect(-10, -36, 4, 8); ctx.fillRect(6, -36, 4, 8);
+  // Face
+  ctx.fillStyle = '#fca'; ctx.fillRect(-6, -22, 12, 8);
+  ctx.fillStyle = '#222'; ctx.fillRect(-4, -20, 3, 2); ctx.fillRect(2, -20, 3, 2);
+  ctx.fillStyle = '#222'; ctx.fillRect(-3, -16, 6, 2);
+  // Body
+  ctx.fillStyle = '#e33'; ctx.fillRect(-10, -14, 20, 16);
+  // Tiger stripe
+  ctx.fillStyle = '#da0'; ctx.fillRect(-10, -2, 20, 6);
+  ctx.fillStyle = '#a60'; ctx.fillRect(-8, -1, 4, 4); ctx.fillRect(0, -1, 4, 4);
+  // Club
+  ctx.fillStyle = '#a80'; ctx.fillRect(10, -28, 5, 20);
+  ctx.fillStyle = '#666'; ctx.fillRect(9, -32, 7, 6);
+  // Legs
+  ctx.fillStyle = '#e33'; ctx.fillRect(-6, 2, 5, 6); ctx.fillRect(1, 2, 5, 6);
+  ctx.fillStyle = '#864'; ctx.fillRect(-6, 8, 5, 2); ctx.fillRect(1, 8, 5, 2);
+}
+
+// Enemy battle sprites (drawn larger)
+function drawEnemyBattle(id, cx, cy) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  const sc = ENEMIES[id].isBoss ? 3 : 2.5;
+  ctx.scale(sc, sc);
+  const c = ENEMIES[id].color;
+  if (id === 'tanuki') {
+    ctx.fillStyle = c; ctx.fillRect(-8,-12,16,16);
+    ctx.fillStyle = '#dca'; ctx.fillRect(-6,-6,12,8);
+    ctx.fillStyle = '#222'; ctx.fillRect(-4,-8,3,2); ctx.fillRect(1,-8,3,2);
+    ctx.fillStyle = '#a85'; ctx.fillRect(-6,-16,4,5); ctx.fillRect(2,-16,4,5);
+    ctx.fillStyle = '#6a3'; ctx.fillRect(-3,-18,6,4);
+    ctx.fillStyle = c; ctx.fillRect(-10,0,6,8); ctx.fillRect(4,0,6,8);
+  } else if (id === 'kooni') {
+    ctx.fillStyle = c; ctx.fillRect(-7,-12,14,18);
+    ctx.fillStyle = '#faa'; ctx.fillRect(-5,-6,10,6);
+    ctx.fillStyle = '#222'; ctx.fillRect(-3,-8,2,2); ctx.fillRect(1,-8,2,2);
+    ctx.fillStyle = '#da0'; ctx.fillRect(-4,-16,3,5); ctx.fillRect(1,-16,3,5);
+    ctx.fillStyle = '#862'; ctx.fillRect(6,-8,4,12);
+  } else if (id === 'tengu') {
+    ctx.fillStyle = c; ctx.fillRect(-8,-14,16,20);
+    ctx.fillStyle = '#fca'; ctx.fillRect(-5,-10,10,8);
+    ctx.fillStyle = '#c44'; ctx.fillRect(-1,-6,8,3);
+    ctx.fillStyle = '#222'; ctx.fillRect(-3,-10,2,2); ctx.fillRect(2,-10,2,2);
+    ctx.fillStyle = '#448'; ctx.fillRect(-12,-8,5,14); ctx.fillRect(7,-8,5,14);
+  } else if (id === 'yamaoni') {
+    ctx.fillStyle = c; ctx.fillRect(-9,-14,18,22);
+    ctx.fillStyle = '#faa'; ctx.fillRect(-6,-8,12,8);
+    ctx.fillStyle = '#222'; ctx.fillRect(-4,-8,3,3); ctx.fillRect(2,-8,3,3);
+    ctx.fillStyle = '#da0'; ctx.fillRect(-5,-18,4,6); ctx.fillRect(1,-18,4,6);
+    ctx.fillStyle = c; ctx.fillRect(-12,-4,4,12); ctx.fillRect(8,-4,4,12);
+  } else if (id === 'iwanaga') {
+    ctx.fillStyle = c; for(let i=0;i<5;i++) ctx.fillRect(-6+i*2,-12+Math.sin(i)*4,6,6);
+    ctx.fillStyle = '#aa8'; ctx.fillRect(-8,-8,16,12);
+    ctx.fillStyle = '#ff0'; ctx.fillRect(-4,-10,3,2); ctx.fillRect(2,-10,3,2);
+    ctx.fillStyle = c; ctx.fillRect(-4,4,8,4);
+  } else if (id === 'kappa') {
+    ctx.fillStyle = c; ctx.fillRect(-8,-12,16,18);
+    ctx.fillStyle = '#8ce'; ctx.fillRect(-6,-18,12,4);
+    ctx.fillStyle = '#fca'; ctx.fillRect(-5,-8,10,6);
+    ctx.fillStyle = '#da0'; ctx.fillRect(-2,-4,4,3);
+    ctx.fillStyle = '#222'; ctx.fillRect(-3,-10,2,2); ctx.fillRect(2,-10,2,2);
+  } else if (id === 'kanimusha') {
+    ctx.fillStyle = c; ctx.fillRect(-10,-10,20,16);
+    ctx.fillStyle = '#e77'; ctx.fillRect(-6,-6,12,8);
+    ctx.fillStyle = '#222'; ctx.fillRect(-3,-6,2,2); ctx.fillRect(2,-6,2,2);
+    ctx.fillStyle = c; ctx.fillRect(-14,-6,5,8); ctx.fillRect(9,-6,5,8);
+    ctx.fillStyle = '#888'; ctx.fillRect(-8,-14,16,6);
+  } else if (id === 'onihei') {
+    ctx.fillStyle = c; ctx.fillRect(-8,-14,16,22);
+    ctx.fillStyle = '#888'; ctx.fillRect(-8,-14,16,6);
+    ctx.fillStyle = '#faa'; ctx.fillRect(-5,-8,10,6);
+    ctx.fillStyle = '#222'; ctx.fillRect(-3,-8,2,2); ctx.fillRect(2,-8,2,2);
+    ctx.fillStyle = '#aaa'; ctx.fillRect(7,-10,4,16);
+    ctx.fillStyle = '#da0'; ctx.fillRect(-3,-18,3,5); ctx.fillRect(1,-18,3,5);
+  } else if (id === 'onijutsu') {
+    ctx.fillStyle = c; ctx.fillRect(-8,-14,16,22);
+    ctx.fillStyle = '#fca'; ctx.fillRect(-5,-10,10,6);
+    ctx.fillStyle = '#222'; ctx.fillRect(-3,-10,2,2); ctx.fillRect(2,-10,2,2);
+    ctx.fillStyle = '#a6c'; ctx.fillRect(-10,-14,20,4);
+    ctx.fillStyle = '#f4f'; ctx.fillRect(-3,0,6,4);
+  } else if (id === 'boss') {
+    drawBossSprite(0, 0);
+  } else {
+    ctx.fillStyle = c || '#f00'; ctx.fillRect(-8,-12,16,18);
+    ctx.fillStyle = '#222'; ctx.fillRect(-4,-8,3,2); ctx.fillRect(2,-8,3,2);
+  }
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════
+// CAMERA & MAP RENDERING
+// ═══════════════════════════════════════
+let camX = 0, camY = 0;
+
+function updateCamera() {
+  const map = MAPS[currentMap];
+  let px = player.x, py = player.y;
+  if (player.moving) {
+    const t = player.moveT / 150;
+    px = player.fromX + (player.x - player.fromX) * t;
+    py = player.fromY + (player.y - player.fromY) * t;
+  }
+  const targetX = px * TS - W / 2 + TS / 2;
+  const targetY = py * TS - H / 2 + TS / 2;
+  camX += (targetX - camX) * 0.15;
+  camY += (targetY - camY) * 0.15;
+  camX = Math.max(0, Math.min(map.w * TS - W, camX));
+  camY = Math.max(0, Math.min(map.h * TS - H, camY));
+}
+
+function renderMap() {
+  const map = MAPS[currentMap];
+  const startCol = Math.max(0, Math.floor(camX / TS));
+  const startRow = Math.max(0, Math.floor(camY / TS));
+  const endCol = Math.min(map.w, Math.ceil((camX + W) / TS) + 1);
+  const endRow = Math.min(map.h, Math.ceil((camY + H) / TS) + 1);
+  for (let r = startRow; r < endRow; r++) {
+    for (let c = startCol; c < endCol; c++) {
+      const tile = map.data[r] ? map.data[r][c] : '.';
+      drawTile(tile, c * TS - camX, r * TS - camY);
+    }
+  }
+  // Draw NPCs
+  if (map.npcs) {
+    for (const npc of map.npcs) {
+      if (npc.flag) {
+        if (npc.flag.startsWith('!') && flags[npc.flag.slice(1)]) continue;
+        if (!npc.flag.startsWith('!') && !flags[npc.flag]) continue;
+      }
+      const sx = npc.x * TS - camX + TS / 2;
+      const sy = npc.y * TS - camY + TS;
+      drawCharSprite(npc.sprite, sx, sy, npc.dir, 0);
+    }
+  }
+  // Draw player
+  let px = player.x, py = player.y;
+  if (player.moving) {
+    const t = Math.min(1, player.moveT / 150);
+    px = player.fromX + (player.x - player.fromX) * t;
+    py = player.fromY + (player.y - player.fromY) * t;
+  }
+  drawCharSprite('momotaro', px * TS - camX + TS / 2, py * TS - camY + TS, player.dir, player.frame);
+}
+
+// ═══════════════════════════════════════
+// DIALOG SYSTEM
+// ═══════════════════════════════════════
+let dialogQueue = [];
+let dialogText = '', dialogDisplayed = '', dialogCharIdx = 0, dialogTimer = 0;
+let dialogCallback = null;
+let dialogChoice = null, dialogChoiceIdx = 0;
+
+function showDialog(texts, callback) {
+  dialogQueue = Array.isArray(texts) ? [...texts] : [texts];
+  dialogCallback = callback || null;
+  advanceDialog();
+  if (gameState === 'map' || gameState === 'prologue') gameState = 'dialog';
+}
+
+function advanceDialog() {
+  if (dialogQueue.length === 0) {
+    gameState = flags.prologueDone ? 'map' : 'prologue';
+    if (dialogCallback) { dialogCallback(); dialogCallback = null; }
+    return;
+  }
+  const next = dialogQueue.shift();
+  if (typeof next === 'string') {
+    dialogText = next; dialogDisplayed = ''; dialogCharIdx = 0; dialogTimer = 0; dialogChoice = null;
+  } else if (next.text) {
+    dialogText = next.text; dialogDisplayed = ''; dialogCharIdx = 0; dialogTimer = 0;
+    dialogChoice = next.choices || null; dialogChoiceIdx = 0;
+  }
+}
+
+function updateDialog(dt) {
+  if (dialogCharIdx < dialogText.length) {
+    dialogTimer += dt;
+    while (dialogTimer > 0.03 && dialogCharIdx < dialogText.length) {
+      dialogDisplayed += dialogText[dialogCharIdx++];
+      dialogTimer -= 0.03;
+    }
+    if (inputPressed.a) { dialogDisplayed = dialogText; dialogCharIdx = dialogText.length; }
+  } else if (inputPressed.a) {
+    seConfirm();
+    advanceDialog();
+  }
+}
+
+function drawDialogBox() {
+  const bx = 16, by = H - 200, bw = W - 32, bh = 160;
+  ctx.fillStyle = 'rgba(8,8,40,0.92)';
+  ctx.fillRect(bx, by, bw, bh);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(bx + 2, by + 2, bw - 4, bh - 4);
+  ctx.fillStyle = '#fff';
+  ctx.font = '18px monospace';
+  ctx.textAlign = 'left';
+  const lines = dialogDisplayed.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    ctx.fillText(lines[i], bx + 16, by + 30 + i * 26);
+  }
+  if (dialogCharIdx >= dialogText.length && !dialogChoice) {
+    if (Math.sin(globalTime * 5) > 0) {
+      ctx.fillText('▼', bx + bw - 30, by + bh - 16);
+    }
+  }
+}
+
+// ═══════════════════════════════════════
+// OVERWORLD
+// ═══════════════════════════════════════
+function canWalk(map, x, y) {
+  if (x < 0 || y < 0 || x >= map.w || y >= map.h) return false;
+  const tile = map.data[y] ? map.data[y][x] : null;
+  if (!tile) return false;
+  const info = TILE_INFO[tile];
+  if (!info || !info.walk) return false;
+  // Check NPC collision
+  if (map.npcs) {
+    for (const npc of map.npcs) {
+      if (npc.x === x && npc.y === y) {
+        if (npc.flag) {
+          if (npc.flag.startsWith('!') && flags[npc.flag.slice(1)]) continue;
+          if (!npc.flag.startsWith('!') && !flags[npc.flag]) continue;
+        }
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function tryInteract() {
+  const map = MAPS[currentMap];
+  const dx = [0, 0, 0, 0], dy = [-1, 1, 0, 0]; // up down left right... wait
+  const dirs = [[0,-1],[0,1],[-1,0],[1,0]];
+  const [ddx, ddy] = dirs[player.dir];
+  const tx = player.x + ddx, ty = player.y + ddy;
+  // Check NPCs
+  if (map.npcs) {
+    for (const npc of map.npcs) {
+      if (npc.x === tx && npc.y === ty) {
+        if (npc.flag) {
+          if (npc.flag.startsWith('!') && flags[npc.flag.slice(1)]) continue;
+          if (!npc.flag.startsWith('!') && !flags[npc.flag]) continue;
+        }
+        triggerNpcDialog(npc);
+        return;
+      }
+    }
+  }
+  // Check sign
+  const tile = map.data[ty] ? map.data[ty][tx] : null;
+  if (tile === 'P') {
+    showDialog(getSignText());
+  }
+  // Check chest
+  if (tile === 'C' && !flags['chest_'+currentMap+'_'+tx+'_'+ty]) {
+    flags['chest_'+currentMap+'_'+tx+'_'+ty] = true;
+    const item = inventory.find(i => i.id === 'momonomi');
+    if (item) item.count += 1;
+    else inventory.push({id:'momonomi',name:'桃の実',heal:50,count:1});
+    showDialog('宝箱をあけた！\n桃の実 を手に入れた！');
+  }
+}
+
+function getSignText() {
+  if (currentMap === 'village') return '「南に進むと森があるぞ。\n 気をつけて行くんじゃ」';
+  return '「この先、危険！」';
+}
+
+function triggerNpcDialog(npc) {
+  if (npc.id === 'grandpa') {
+    showDialog('おじいさん「桃太郎よ、\n 南の森を抜けて鬼ヶ島を目指せ。\n がんばるんじゃぞ！」');
+  } else if (npc.id === 'grandma') {
+    showDialog('おばあさん「きびだんごを持って\n おいき。仲間が増えるかもよ。」');
+  } else if (npc.id === 'villager1') {
+    showDialog('村人「最近、鬼が暴れて\n 困っているんだ...」');
+  } else if (npc.id === 'dog_npc') {
+    showDialog([
+      '犬「ワン！ その きびだんご\n 一つくださいな！」',
+      '桃太郎は きびだんごを あげた！',
+      '犬「ありがとう！ お供します！\n 犬が仲間になった！」',
+    ], () => { flags.hasDog = true; addPartyMember('dog'); seRecruit(); });
+  } else if (npc.id === 'monkey_npc') {
+    showDialog([
+      '猿「キキッ！ いい匂いがする！\n きびだんご くれるかい？」',
+      '桃太郎は きびだんごを あげた！',
+      '猿「やったー！ 一緒に行くよ！\n 猿が仲間になった！」',
+    ], () => { flags.hasMonkey = true; addPartyMember('monkey'); seRecruit(); });
+  } else if (npc.id === 'pheasant_npc') {
+    showDialog([
+      '雉「ケーン！ 鬼退治に行くの？\n きびだんごをくれたら手伝うよ！」',
+      '桃太郎は きびだんごを あげた！',
+      '雉「よし、空から援護するよ！\n 雉が仲間になった！」',
+    ], () => { flags.hasPheasant = true; addPartyMember('pheasant'); seRecruit(); });
+  } else if (npc.id === 'boss_npc') {
+    showDialog([
+      '鬼大将「ガハハ！ 小僧ども、\n よくぞここまで来たな！」',
+      '鬼大将「だが、ここが貴様らの\n 旅の終わりだ！」',
+    ], () => { startBattle(['boss']); });
+  } else {
+    showDialog(npc.name + '「...」');
+  }
+}
+
+function checkEncounter() {
+  const map = MAPS[currentMap];
+  if (!map.encounters || map.encounters.length === 0) return;
+  const tile = map.data[player.y][player.x];
+  const info = TILE_INFO[tile];
+  if (!info || !info.enc) return;
+  if (Math.random() > 0.12) return; // ~12% per step
+  // Pick encounter
+  const totalW = map.encounters.reduce((s, e) => s + e.w, 0);
+  let r = Math.random() * totalW;
+  for (const enc of map.encounters) {
+    r -= enc.w;
+    if (r <= 0) { startBattle([...enc.enemies]); return; }
+  }
+}
+
+function checkTransition() {
+  const map = MAPS[currentMap];
+  if (!map.transitions) return;
+  for (const tr of map.transitions) {
+    if (player.x === tr.x && player.y === tr.y) {
+      fadeTransition(() => {
+        currentMap = tr.to;
+        player.x = tr.tx; player.y = tr.ty;
+        player.moving = false;
+        camX = player.x * TS - W / 2;
+        camY = player.y * TS - H / 2;
+        const m = MAPS[currentMap];
+        if (m.bgm) playBGM(m.bgm);
+      });
+      return;
+    }
+  }
+}
+
+function updateOverworld(dt) {
+  if (player.moving) {
+    player.moveT += dt * 1000;
+    if (player.moveT >= 150) {
+      player.moving = false;
+      player.moveT = 0;
+      stepCount++;
+      checkTransition();
+      if (gameState === 'map') checkEncounter();
+    }
+    return;
+  }
+  // Movement
+  let dx = 0, dy = 0, newDir = player.dir;
+  if (input.up) { dy = -1; newDir = 0; }
+  else if (input.down) { dy = 1; newDir = 1; }
+  else if (input.left) { dx = -1; newDir = 2; }
+  else if (input.right) { dx = 1; newDir = 3; }
+  player.dir = newDir;
+  if (dx !== 0 || dy !== 0) {
+    const nx = player.x + dx, ny = player.y + dy;
+    if (canWalk(MAPS[currentMap], nx, ny)) {
+      player.fromX = player.x; player.fromY = player.y;
+      player.x = nx; player.y = ny;
+      player.moving = true; player.moveT = 0;
+      player.frame = 1 - player.frame;
+    }
+  }
+  // Interact
+  if (inputPressed.a) tryInteract();
+  // Menu
+  if (inputPressed.b) { gameState = 'menu'; seCursor(); }
+}
+
+// ═══════════════════════════════════════
+// BATTLE SYSTEM
+// ═══════════════════════════════════════
+let battle = null;
+// battle phases: intro, command, target, execute, result
+function startBattle(enemyIds) {
+  ensureAudio();
+  const isBoss = enemyIds.includes('boss');
+  battle = {
+    enemies: enemyIds.map(id => ({ ...ENEMIES[id], id, hp: ENEMIES[id].hp, maxHp: ENEMIES[id].hp, alive: true })),
+    phase: 'intro', introTimer: 0,
+    cmdMember: 0, cmdIdx: 0, commands: [],
+    actions: [], actionIdx: 0, actionTimer: 0,
+    message: '', msgTimer: 0,
+    result: '', resultTimer: 0,
+    expGained: 0, goldGained: 0,
+    levelUps: [],
+    shakeTimer: 0, flashTimer: 0,
+    isBoss,
+    bossPhase: 1,
+  };
+  gameState = 'battle';
+  if (isBoss) playBGM('boss'); else playBGM('battle');
+}
+
+function updateBattle(dt) {
+  if (!battle) return;
+  battle.shakeTimer = Math.max(0, battle.shakeTimer - dt);
+  battle.flashTimer = Math.max(0, battle.flashTimer - dt);
+
+  if (battle.phase === 'intro') {
+    battle.introTimer += dt;
+    if (battle.introTimer > 1) {
+      battle.phase = 'command'; battle.cmdMember = 0; battle.cmdIdx = 0; battle.commands = [];
+    }
+  } else if (battle.phase === 'command') {
+    // Navigate commands: 0=たたかう 1=まもる 2=とくぎ 3=どうぐ
+    if (inputPressed.up || inputPressed.left) { battle.cmdIdx = (battle.cmdIdx + 3) % 4; seCursor(); }
+    if (inputPressed.down || inputPressed.right) { battle.cmdIdx = (battle.cmdIdx + 1) % 4; seCursor(); }
+    if (inputPressed.a) {
+      seConfirm();
+      const member = party[battle.cmdMember];
+      if (battle.cmdIdx === 0) { // Attack
+        battle.commands.push({ type: 'attack', member: battle.cmdMember, target: 0 });
+      } else if (battle.cmdIdx === 1) { // Guard
+        battle.commands.push({ type: 'guard', member: battle.cmdMember });
+      } else if (battle.cmdIdx === 2) { // Skill
+        if (member.mp >= member.skillCost) {
+          battle.commands.push({ type: 'skill', member: battle.cmdMember, target: 0 });
+        } else {
+          battle.commands.push({ type: 'attack', member: battle.cmdMember, target: 0 });
+        }
+      } else { // Item
+        const healItem = inventory.find(i => i.heal && i.count > 0);
+        if (healItem) {
+          battle.commands.push({ type: 'item', member: battle.cmdMember, item: healItem });
+        } else {
+          battle.commands.push({ type: 'attack', member: battle.cmdMember, target: 0 });
+        }
+      }
+      battle.cmdMember++;
+      battle.cmdIdx = 0;
+      if (battle.cmdMember >= party.length) {
+        buildActionQueue();
+        battle.phase = 'execute'; battle.actionIdx = 0; battle.actionTimer = 0;
+      }
+    }
+    if (inputPressed.b && battle.cmdMember > 0) {
+      battle.cmdMember--; battle.commands.pop(); seCancel();
+    }
+  } else if (battle.phase === 'execute') {
+    battle.actionTimer += dt;
+    if (battle.actionTimer >= 1.0) {
+      battle.actionTimer = 0;
+      if (battle.actionIdx < battle.actions.length) {
+        executeAction(battle.actions[battle.actionIdx]);
+        battle.actionIdx++;
+        // Check win/lose
+        if (battle.enemies.every(e => !e.alive)) {
+          battle.phase = 'result'; battle.result = 'victory'; battle.resultTimer = 0;
+          calcBattleReward();
+          seVictory();
+          return;
+        }
+        if (party.every(p => p.hp <= 0)) {
+          battle.phase = 'result'; battle.result = 'defeat'; battle.resultTimer = 0;
+          return;
+        }
+      } else {
+        // All actions done, new turn
+        battle.phase = 'command'; battle.cmdMember = 0; battle.cmdIdx = 0; battle.commands = [];
+      }
+    }
+  } else if (battle.phase === 'result') {
+    battle.resultTimer += dt;
+    if (battle.resultTimer > 2 && inputPressed.a) {
+      if (battle.result === 'victory') {
+        if (battle.isBoss) {
+          flags.bossDefeated = true;
+          gameState = 'ending';
+          seBossDefeat();
+          stopBGM();
+        } else {
+          gameState = 'map';
+          playBGM(MAPS[currentMap].bgm);
+        }
+      } else {
+        // Defeat: heal party, return to map
+        party.forEach(p => { p.hp = Math.ceil(p.maxHp / 2); p.mp = Math.ceil(p.maxMp / 2); });
+        gameState = 'map';
+        playBGM(MAPS[currentMap].bgm);
+        showDialog('桃太郎たちは やられてしまった...\nしかし 不思議な力で蘇った！');
+      }
+      battle = null;
+    }
+  }
+}
+
+function buildActionQueue() {
+  const actions = [];
+  // Party actions
+  for (const cmd of battle.commands) {
+    const member = party[cmd.member];
+    if (member.hp <= 0) continue;
+    actions.push({ ...cmd, spd: member.spd + Math.random() * 3, isParty: true, actor: member });
+  }
+  // Enemy actions
+  for (let i = 0; i < battle.enemies.length; i++) {
+    const e = battle.enemies[i];
+    if (!e.alive) continue;
+    const act = { type: 'enemy_attack', enemyIdx: i, spd: e.spd + Math.random() * 3, isParty: false, actor: e };
+    // Boss special attacks
+    if (e.isBoss) {
+      const hpPct = e.hp / e.maxHp;
+      if (hpPct < 0.33) act.type = Math.random() < 0.4 ? 'boss_fire' : (Math.random() < 0.5 ? 'boss_smash' : 'enemy_attack');
+      else if (hpPct < 0.66) act.type = Math.random() < 0.3 ? 'boss_roar' : (Math.random() < 0.5 ? 'boss_smash' : 'enemy_attack');
+      else act.type = Math.random() < 0.3 ? 'boss_smash' : 'enemy_attack';
+    }
+    actions.push(act);
+  }
+  actions.sort((a, b) => b.spd - a.spd);
+  battle.actions = actions;
+}
+
+function calcDamage(atk, def) {
+  return Math.max(1, Math.floor(atk * (0.85 + Math.random() * 0.3) - def / 2));
+}
+
+function executeAction(act) {
+  if (act.isParty) {
+    const member = act.actor;
+    if (member.hp <= 0) { battle.message = ''; return; }
+    // Find alive enemy target
+    let target = battle.enemies.find(e => e.alive);
+    if (!target) { battle.message = ''; return; }
+    if (act.type === 'attack') {
+      const dmg = calcDamage(member.atk, target.def);
+      target.hp = Math.max(0, target.hp - dmg);
+      if (target.hp <= 0) target.alive = false;
+      battle.message = member.name + 'の攻撃！\n' + target.name + 'に ' + dmg + ' ダメージ！';
+      battle.shakeTimer = 0.2; seAttack();
+    } else if (act.type === 'guard') {
+      member._guarding = true;
+      battle.message = member.name + 'は 身を守っている！';
+    } else if (act.type === 'skill') {
+      member.mp -= member.skillCost;
+      if (member.hits) {
+        let totalDmg = 0;
+        for (let h = 0; h < member.hits; h++) {
+          const dmg = calcDamage(Math.floor(member.atk * member.skillMult), target.def);
+          totalDmg += dmg;
+        }
+        target.hp = Math.max(0, target.hp - totalDmg);
+        if (target.hp <= 0) target.alive = false;
+        battle.message = member.name + 'の' + member.skillName + '！\n' + target.name + 'に ' + totalDmg + ' ダメージ！';
+      } else if (member.aoe) {
+        let totalDmg = 0;
+        for (const e of battle.enemies) {
+          if (!e.alive) continue;
+          const dmg = calcDamage(Math.floor(member.atk * member.skillMult), e.def);
+          e.hp = Math.max(0, e.hp - dmg);
+          if (e.hp <= 0) e.alive = false;
+          totalDmg += dmg;
+        }
+        battle.message = member.name + 'の' + member.skillName + '！\n全体に ' + totalDmg + ' ダメージ！';
+      } else {
+        const dmg = calcDamage(Math.floor(member.atk * member.skillMult), target.def);
+        target.hp = Math.max(0, target.hp - dmg);
+        if (target.hp <= 0) target.alive = false;
+        battle.message = member.name + 'の' + member.skillName + '！\n' + target.name + 'に ' + dmg + ' ダメージ！';
+      }
+      battle.shakeTimer = 0.3; seAttack();
+    } else if (act.type === 'item') {
+      const item = act.item;
+      item.count--;
+      member.hp = Math.min(member.maxHp, member.hp + item.heal);
+      battle.message = member.name + 'は ' + item.name + ' を使った！\nHPが ' + item.heal + ' 回復！';
+      seHeal();
+    }
+  } else {
+    // Enemy action
+    const enemy = act.actor;
+    if (!enemy.alive) { battle.message = ''; return; }
+    const aliveParty = party.filter(p => p.hp > 0);
+    if (aliveParty.length === 0) return;
+    const target = aliveParty[Math.floor(Math.random() * aliveParty.length)];
+    const guardMult = target._guarding ? 0.5 : 1;
+
+    if (act.type === 'enemy_attack') {
+      const dmg = Math.max(1, Math.floor(calcDamage(enemy.atk, target.def) * guardMult));
+      target.hp = Math.max(0, target.hp - dmg);
+      battle.message = enemy.name + 'の攻撃！\n' + target.name + 'に ' + dmg + ' ダメージ！';
+      battle.flashTimer = 0.15; seHit();
+    } else if (act.type === 'boss_smash') {
+      const dmg = Math.max(1, Math.floor(calcDamage(Math.floor(enemy.atk * 1.8), target.def) * guardMult));
+      target.hp = Math.max(0, target.hp - dmg);
+      battle.message = enemy.name + 'の金棒スマッシュ！\n' + target.name + 'に ' + dmg + ' ダメージ！';
+      battle.shakeTimer = 0.4; battle.flashTimer = 0.2; seHit();
+    } else if (act.type === 'boss_roar') {
+      enemy.atk += 3;
+      battle.message = enemy.name + 'の雄叫び！\n攻撃力が上がった！';
+      battle.shakeTimer = 0.3;
+    } else if (act.type === 'boss_fire') {
+      let totalDmg = 0;
+      for (const p of party) {
+        if (p.hp <= 0) continue;
+        const gm = p._guarding ? 0.5 : 1;
+        const dmg = Math.max(1, Math.floor(calcDamage(Math.floor(enemy.atk * 0.8), p.def) * gm));
+        p.hp = Math.max(0, p.hp - dmg);
+        totalDmg += dmg;
+      }
+      battle.message = enemy.name + 'の鬼火！\n全体に ' + totalDmg + ' ダメージ！';
+      battle.flashTimer = 0.3; battle.shakeTimer = 0.3; seHit();
+    }
+  }
+}
+
+function calcBattleReward() {
+  let exp = 0;
+  for (const e of battle.enemies) exp += ENEMIES[e.id].exp;
+  battle.expGained = exp;
+  battle.levelUps = [];
+  for (const p of party) {
+    if (p.hp <= 0) continue;
+    p.exp += exp;
+    const needed = p.level * 15;
+    if (p.exp >= needed) {
+      p.exp -= needed;
+      levelUp(p);
+      battle.levelUps.push(p.name);
+      seLevelUp();
+    }
+  }
+  // Clear guard status
+  party.forEach(p => p._guarding = false);
+}
+
+function drawBattle() {
+  const sx = battle.shakeTimer > 0 ? (Math.random() - 0.5) * 8 : 0;
+  const sy = battle.shakeTimer > 0 ? (Math.random() - 0.5) * 8 : 0;
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  // Background
+  const bg = battle.isBoss ? '#211' : '#223';
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+  // Ground
+  ctx.fillStyle = battle.isBoss ? '#332' : '#334';
+  ctx.fillRect(0, 280, W, 60);
+
+  // Enemies
+  const ew = W / (battle.enemies.length + 1);
+  battle.enemies.forEach((e, i) => {
+    if (!e.alive) return;
+    drawEnemyBattle(e.id, ew * (i + 1), 180);
+    // HP bar
+    const bx = ew * (i + 1) - 30, by = 260;
+    ctx.fillStyle = '#400'; ctx.fillRect(bx, by, 60, 8);
+    ctx.fillStyle = '#e44'; ctx.fillRect(bx, by, 60 * (e.hp / e.maxHp), 8);
+    ctx.fillStyle = '#fff'; ctx.font = '12px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(e.name, ew * (i + 1), by + 20);
+  });
+
+  // Flash effect
+  if (battle.flashTimer > 0) {
+    ctx.fillStyle = 'rgba(255,255,255,' + (battle.flashTimer * 3) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // Party status
+  const psy = 480;
+  ctx.fillStyle = 'rgba(8,8,40,0.9)'; ctx.fillRect(10, psy, W - 20, party.length * 32 + 16);
+  ctx.strokeStyle = '#aaf'; ctx.lineWidth = 1; ctx.strokeRect(12, psy + 2, W - 24, party.length * 32 + 12);
+  party.forEach((p, i) => {
+    const py2 = psy + 12 + i * 32;
+    ctx.fillStyle = p.hp <= 0 ? '#666' : '#fff';
+    ctx.font = '16px monospace'; ctx.textAlign = 'left';
+    ctx.fillText(p.name, 24, py2 + 14);
+    ctx.fillText('HP ' + p.hp + '/' + p.maxHp, 120, py2 + 14);
+    ctx.fillText('MP ' + p.mp + '/' + p.maxMp, 280, py2 + 14);
+    // HP bar
+    ctx.fillStyle = '#400'; ctx.fillRect(200, py2 + 4, 60, 6);
+    ctx.fillStyle = p.hp / p.maxHp > 0.3 ? '#4e4' : '#e44';
+    ctx.fillRect(200, py2 + 4, 60 * Math.max(0, p.hp / p.maxHp), 6);
+  });
+
+  // Command phase
+  if (battle.phase === 'command') {
+    const cx2 = 30, cy2 = 370;
+    ctx.fillStyle = 'rgba(8,8,40,0.92)'; ctx.fillRect(cx2, cy2, 200, 100);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(cx2+2, cy2+2, 196, 96);
+    const cmds = ['たたかう', 'まもる', 'とくぎ', 'どうぐ'];
+    ctx.font = '18px monospace'; ctx.textAlign = 'left';
+    const activeMember = party[battle.cmdMember];
+    ctx.fillStyle = '#ff8';
+    ctx.fillText(activeMember.name, cx2 + 10, cy2 - 6);
+    cmds.forEach((cmd, i) => {
+      ctx.fillStyle = i === battle.cmdIdx ? '#ff8' : '#fff';
+      ctx.fillText((i === battle.cmdIdx ? '▶' : '　') + cmd, cx2 + 12, cy2 + 26 + i * 22);
+    });
+  }
+
+  // Execute phase - show message
+  if (battle.phase === 'execute' && battle.message) {
+    const mx = 16, my = 370;
+    ctx.fillStyle = 'rgba(8,8,40,0.92)'; ctx.fillRect(mx, my, W - 32, 70);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.strokeRect(mx+2, my+2, W-36, 66);
+    ctx.fillStyle = '#fff'; ctx.font = '16px monospace'; ctx.textAlign = 'left';
+    const lines = battle.message.split('\n');
+    lines.forEach((l, i) => ctx.fillText(l, mx + 12, my + 24 + i * 22));
+  }
+
+  // Result phase
+  if (battle.phase === 'result') {
+    const rx = 60, ry = 200, rw = W - 120, rh = 200;
+    ctx.fillStyle = 'rgba(8,8,40,0.95)'; ctx.fillRect(rx, ry, rw, rh);
+    ctx.strokeStyle = '#ff8'; ctx.lineWidth = 2; ctx.strokeRect(rx+2, ry+2, rw-4, rh-4);
+    ctx.textAlign = 'center'; ctx.font = '22px monospace';
+    if (battle.result === 'victory') {
+      ctx.fillStyle = '#ff8'; ctx.fillText('勝利！', W/2, ry + 40);
+      ctx.font = '16px monospace'; ctx.fillStyle = '#fff';
+      ctx.fillText(battle.expGained + ' EXP を獲得！', W/2, ry + 80);
+      if (battle.levelUps.length > 0) {
+        ctx.fillStyle = '#8f8';
+        ctx.fillText(battle.levelUps.join('、') + ' はレベルアップ！', W/2, ry + 110);
+      }
+      if (battle.resultTimer > 2) {
+        ctx.fillStyle = '#aaa'; ctx.font = '14px monospace';
+        ctx.fillText('Aボタンで続ける', W/2, ry + rh - 20);
+      }
+    } else {
+      ctx.fillStyle = '#f44'; ctx.fillText('全滅...', W/2, ry + 40);
+      if (battle.resultTimer > 2) {
+        ctx.fillStyle = '#aaa'; ctx.font = '14px monospace';
+        ctx.fillText('Aボタンで続ける', W/2, ry + rh - 20);
+      }
+    }
+  }
+
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════
+// MENU
+// ═══════════════════════════════════════
+let menuIdx = 0;
+function updateMenu(dt) {
+  if (inputPressed.b) { gameState = 'map'; seCancel(); return; }
+  if (inputPressed.up) { menuIdx = (menuIdx - 1 + party.length) % party.length; seCursor(); }
+  if (inputPressed.down) { menuIdx = (menuIdx + 1) % party.length; seCursor(); }
+}
+
+function drawMenu() {
+  ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(0, 0, W, H);
+  const bx = 30, by = 40, bw = W - 60, bh = H - 180;
+  ctx.fillStyle = 'rgba(8,8,40,0.95)'; ctx.fillRect(bx, by, bw, bh);
+  ctx.strokeStyle = '#aaf'; ctx.lineWidth = 2; ctx.strokeRect(bx+2, by+2, bw-4, bh-4);
+
+  ctx.fillStyle = '#ff8'; ctx.font = '20px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('パーティ', W/2, by + 30);
+
+  party.forEach((p, i) => {
+    const py2 = by + 50 + i * 100;
+    const sel = i === menuIdx;
+    ctx.fillStyle = sel ? '#ff8' : '#fff'; ctx.font = '18px monospace'; ctx.textAlign = 'left';
+    ctx.fillText((sel ? '▶' : '　') + p.name + ' Lv.' + p.level, bx + 16, py2 + 20);
+    ctx.fillStyle = '#ccc'; ctx.font = '14px monospace';
+    ctx.fillText('HP ' + p.hp + '/' + p.maxHp + '  MP ' + p.mp + '/' + p.maxMp, bx + 40, py2 + 44);
+    ctx.fillText('ATK ' + p.atk + '  DEF ' + p.def + '  SPD ' + p.spd, bx + 40, py2 + 64);
+    ctx.fillText('EXP ' + p.exp + '/' + (p.level * 15), bx + 40, py2 + 84);
+  });
+
+  // Items
+  const iy = by + 50 + party.length * 100 + 10;
+  ctx.fillStyle = '#ff8'; ctx.font = '16px monospace'; ctx.textAlign = 'left';
+  ctx.fillText('もちもの:', bx + 16, iy);
+  let ix = 0;
+  for (const item of inventory) {
+    if (item.count > 0) {
+      ctx.fillStyle = '#fff';
+      ctx.fillText(item.name + ' x' + item.count, bx + 40, iy + 24 + ix * 20);
+      ix++;
+    }
+  }
+  ctx.fillStyle = '#888'; ctx.font = '14px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('Bボタンで閉じる', W/2, by + bh - 16);
+}
+
+// ═══════════════════════════════════════
+// PROLOGUE
+// ═══════════════════════════════════════
+let prologueIdx = 0;
+const PROLOGUE = [
+  'むかしむかし、あるところに\nおじいさんとおばあさんが\nおりました。',
+  'ある日、川から大きな桃が\nどんぶらこ どんぶらこと\n流れてきました。',
+  '桃を割ると、中から\n元気な男の子が生まれました。\n「桃太郎」と名付けられました。',
+  'すくすくと育った桃太郎。\nしかし ある日、鬼たちが\n村を荒らし始めました。',
+  '「おじいさん、おばあさん、\n わたしが鬼を退治してきます！」',
+  'おばあさんは きびだんごを\n作ってくれました。\n\nこうして桃太郎の冒険が始まった...',
+];
+
+function updatePrologue(dt) {
+  if (gameState === 'dialog') return; // dialog system handles it
+  if (prologueIdx < PROLOGUE.length) {
+    showDialog(PROLOGUE[prologueIdx]);
+    prologueIdx++;
+  } else {
+    flags.prologueDone = true;
+    gameState = 'map';
+    currentMap = 'village';
+    const sp = MAPS.village.spawn;
+    player.x = sp.x; player.y = sp.y; player.dir = 1;
+    camX = player.x * TS - W / 2; camY = player.y * TS - H / 2;
+    playBGM('village');
+    initParty();
+  }
+}
+
+function drawPrologue() {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#ff8'; ctx.font = '24px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('桃太郎RPG', W/2, 80);
+}
+
+// ═══════════════════════════════════════
+// TITLE SCREEN
+// ═══════════════════════════════════════
+function updateTitle(dt) {
+  if (inputPressed.a) {
+    ensureAudio();
+    seConfirm();
+    gameState = 'prologue';
+    prologueIdx = 0;
+  }
+}
+
+function drawTitle() {
+  // Background
+  ctx.fillStyle = '#112'; ctx.fillRect(0, 0, W, H);
+
+  // Peach illustration
+  const px = W/2, py = 260;
+  ctx.fillStyle = '#f8a'; ctx.beginPath(); ctx.arc(px, py, 60, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#fac'; ctx.beginPath(); ctx.arc(px-15, py-15, 25, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#4a4'; ctx.fillRect(px-3, py-70, 6, 20);
+  ctx.fillStyle = '#5b5';
+  ctx.beginPath(); ctx.ellipse(px+15, py-65, 20, 8, 0.3, 0, Math.PI*2); ctx.fill();
+
+  // Title
+  ctx.fillStyle = '#ff8'; ctx.font = 'bold 40px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('桃太郎RPG', W/2, 120);
+  ctx.fillStyle = '#fca'; ctx.font = '18px monospace';
+  ctx.fillText('〜鬼退治の旅〜', W/2, 155);
+
+  // Start prompt
+  if (Math.sin(globalTime * 3) > -0.3) {
+    ctx.fillStyle = '#fff'; ctx.font = '20px monospace';
+    ctx.fillText('PRESS START', W/2, 430);
+    ctx.fillStyle = '#aaa'; ctx.font = '14px monospace';
+    ctx.fillText('Zキー / スペース / タップ', W/2, 460);
+  }
+
+  // Controls info
+  ctx.fillStyle = '#667'; ctx.font = '13px monospace';
+  ctx.fillText('移動: 矢印キー / D-pad', W/2, 540);
+  ctx.fillText('決定: Z / Space    戻る: X / Esc', W/2, 560);
+}
+
+// ═══════════════════════════════════════
+// ENDING
+// ═══════════════════════════════════════
+let endingTimer = 0;
+function updateEnding(dt) {
+  endingTimer += dt;
+  if (endingTimer > 10 && inputPressed.a) {
+    gameState = 'title';
+    endingTimer = 0;
+    stopBGM();
+  }
+}
+
+function drawEnding() {
+  ctx.fillStyle = '#001'; ctx.fillRect(0, 0, W, H);
+
+  const scroll = Math.min(endingTimer * 20, 0);
+  ctx.fillStyle = '#ff8'; ctx.font = '28px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('鬼大将を倒した！', W/2, 100);
+
+  ctx.fillStyle = '#fff'; ctx.font = '18px monospace';
+  const texts = [
+    '桃太郎たちは見事',
+    '鬼大将を退治しました。',
+    '',
+    '鬼たちは降参し、',
+    '奪った宝物を返しました。',
+    '',
+    '桃太郎は仲間たちと共に',
+    '村へ凱旋しました。',
+    '',
+    'おじいさんとおばあさんは',
+    '大喜びで迎えてくれました。',
+    '',
+    '',
+    'めでたし、めでたし。',
+  ];
+  texts.forEach((t, i) => {
+    const a = Math.max(0, Math.min(1, (endingTimer - 1 - i * 0.5) * 2));
+    if (a > 0) {
+      ctx.fillStyle = `rgba(255,255,255,${a})`;
+      ctx.fillText(t, W/2, 180 + i * 28);
+    }
+  });
+
+  if (endingTimer > 8) {
+    ctx.fillStyle = '#ff8'; ctx.font = '36px monospace';
+    ctx.fillText('T H E   E N D', W/2, H - 100);
+    if (endingTimer > 10 && Math.sin(globalTime * 3) > 0) {
+      ctx.fillStyle = '#aaa'; ctx.font = '14px monospace';
+      ctx.fillText('Aボタンでタイトルへ', W/2, H - 50);
+    }
+  }
+}
+
+// ═══════════════════════════════════════
+// TRANSITIONS
+// ═══════════════════════════════════════
+function fadeTransition(callback) {
+  fadeAlpha = 0; fadeDir = 1; fadeCallback = () => {
+    callback();
+    fadeDir = -1;
+  };
+  gameState = 'transition';
+}
+
+function updateTransition(dt) {
+  fadeAlpha += fadeDir * dt * 3;
+  if (fadeDir > 0 && fadeAlpha >= 1) {
+    fadeAlpha = 1;
+    if (fadeCallback) { fadeCallback(); fadeCallback = null; }
+  }
+  if (fadeDir < 0 && fadeAlpha <= 0) {
+    fadeAlpha = 0; fadeDir = 0;
+    gameState = 'map';
+  }
+}
+
+// ═══════════════════════════════════════
+// TOUCH CONTROLS OVERLAY
+// ═══════════════════════════════════════
+function drawTouchControls() {
+  if (gameState === 'battle' || gameState === 'title' || gameState === 'ending') return;
+  ctx.globalAlpha = 0.3;
+  // D-pad
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(DPAD_X-12, DPAD_Y-DPAD_R, 24, 24); // up
+  ctx.fillRect(DPAD_X-12, DPAD_Y+DPAD_R-24, 24, 24); // down
+  ctx.fillRect(DPAD_X-DPAD_R, DPAD_Y-12, 24, 24); // left
+  ctx.fillRect(DPAD_X+DPAD_R-24, DPAD_Y-12, 24, 24); // right
+  ctx.fillRect(DPAD_X-10, DPAD_Y-10, 20, 20); // center
+
+  // Arrows
+  ctx.fillStyle = '#222';
+  // Up arrow
+  ctx.beginPath(); ctx.moveTo(DPAD_X,DPAD_Y-DPAD_R+4); ctx.lineTo(DPAD_X-6,DPAD_Y-DPAD_R+16); ctx.lineTo(DPAD_X+6,DPAD_Y-DPAD_R+16); ctx.fill();
+  // Down arrow
+  ctx.beginPath(); ctx.moveTo(DPAD_X,DPAD_Y+DPAD_R-4); ctx.lineTo(DPAD_X-6,DPAD_Y+DPAD_R-16); ctx.lineTo(DPAD_X+6,DPAD_Y+DPAD_R-16); ctx.fill();
+  // Left arrow
+  ctx.beginPath(); ctx.moveTo(DPAD_X-DPAD_R+4,DPAD_Y); ctx.lineTo(DPAD_X-DPAD_R+16,DPAD_Y-6); ctx.lineTo(DPAD_X-DPAD_R+16,DPAD_Y+6); ctx.fill();
+  // Right arrow
+  ctx.beginPath(); ctx.moveTo(DPAD_X+DPAD_R-4,DPAD_Y); ctx.lineTo(DPAD_X+DPAD_R-16,DPAD_Y-6); ctx.lineTo(DPAD_X+DPAD_R-16,DPAD_Y+6); ctx.fill();
+
+  // A button
+  ctx.fillStyle = '#4f4';
+  ctx.beginPath(); ctx.arc(ABTN_X, ABTN_Y, ABTN_R, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 20px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('A', ABTN_X, ABTN_Y + 7);
+
+  // B button
+  ctx.fillStyle = '#f44';
+  ctx.beginPath(); ctx.arc(BBTN_X, BBTN_Y, BBTN_R, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 16px monospace';
+  ctx.fillText('B', BBTN_X, BBTN_Y + 6);
+
+  ctx.globalAlpha = 1;
+}
+
+// ═══════════════════════════════════════
+// HUD
+// ═══════════════════════════════════════
+function drawHUD() {
+  if (gameState !== 'map') return;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0, 0, W, 28);
+  ctx.fillStyle = '#fff'; ctx.font = '14px monospace'; ctx.textAlign = 'left';
+  const mapNames = {village:'桃太郎の村',forest:'森',mountain:'山',beach:'浜辺',onigashima:'鬼ヶ島'};
+  ctx.fillText(mapNames[currentMap] || currentMap, 10, 19);
+  ctx.textAlign = 'right';
+  ctx.fillText('Lv.' + (party[0] ? party[0].level : 1), W - 10, 19);
+}
+
+// ═══════════════════════════════════════
+// MAIN UPDATE
+// ═══════════════════════════════════════
+const FIXED_DT = 1 / 60;
+
+function update(dt) {
+  globalTime += dt;
+  updateInput();
+
+  if (gameState === 'title') updateTitle(dt);
+  else if (gameState === 'prologue') updatePrologue(dt);
+  else if (gameState === 'map') { updateOverworld(dt); updateCamera(); }
+  else if (gameState === 'dialog') { updateDialog(dt); if (gameState === 'map') updateCamera(); }
+  else if (gameState === 'battle') updateBattle(dt);
+  else if (gameState === 'menu') updateMenu(dt);
+  else if (gameState === 'transition') { updateTransition(dt); updateCamera(); }
+  else if (gameState === 'ending') updateEnding(dt);
+
+  // Reset per-frame input
+  for (const k of ['a','b','up','down','left','right']) inputPressed[k] = false;
+}
+
+// ═══════════════════════════════════════
+// MAIN RENDER
+// ═══════════════════════════════════════
+function render() {
+  ctx.clearRect(0, 0, W, H);
+
+  if (gameState === 'title') { drawTitle(); return; }
+  if (gameState === 'ending') { drawEnding(); return; }
+  if (gameState === 'battle') { drawBattle(); return; }
+
+  // Map-based states
+  if (gameState === 'map' || gameState === 'dialog' || gameState === 'transition' || gameState === 'menu' || gameState === 'prologue') {
+    if (flags.prologueDone) {
+      renderMap();
+      drawHUD();
+    }
+    if (gameState === 'prologue') drawPrologue();
+    if (gameState === 'dialog') drawDialogBox();
+    if (gameState === 'menu') drawMenu();
+    drawTouchControls();
+  }
+
+  // Fade overlay
+  if (fadeAlpha > 0) {
+    ctx.fillStyle = `rgba(0,0,0,${fadeAlpha})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+// ═══════════════════════════════════════
+// GAME LOOP
+// ═══════════════════════════════════════
+let lastTime = 0, accumulator = 0;
+
+function loop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
+  lastTime = timestamp;
+  accumulator += dt;
+  while (accumulator >= FIXED_DT) {
+    update(FIXED_DT);
+    accumulator -= FIXED_DT;
+  }
+  render();
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(loop); });
+
+</script>
+</body>
+</html>
