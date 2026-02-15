@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>ぷにぷに 〜水まんじゅうキャッチゲーム〜</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  width: 100%; height: 100%;
+  background: #1a1a2e;
+  overflow: hidden;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+body {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+canvas {
+  display: block;
+  image-rendering: auto;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ── Canvas Setup ──
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 480, H = 720;
+canvas.width = W;
+canvas.height = H;
+
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── Audio ──
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function playTone(freq, dur, type, vol) {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type || 'sine';
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(vol || 0.15, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime + dur);
+}
+
+function sndCatch(combo) {
+  ensureAudio();
+  const base = 523 + combo * 80;
+  playTone(base, 0.12, 'sine', 0.18);
+  setTimeout(() => playTone(base * 1.25, 0.1, 'sine', 0.12), 50);
+}
+
+function sndMiss() {
+  ensureAudio();
+  playTone(200, 0.3, 'triangle', 0.15);
+  setTimeout(() => playTone(150, 0.25, 'triangle', 0.12), 80);
+}
+
+function sndRottenCatch() {
+  ensureAudio();
+  playTone(120, 0.25, 'sawtooth', 0.12);
+  setTimeout(() => playTone(90, 0.35, 'square', 0.08), 60);
+  setTimeout(() => playTone(70, 0.3, 'sawtooth', 0.06), 150);
+}
+
+function sndGameOver() {
+  ensureAudio();
+  [0, 150, 300, 450].forEach((t, i) => {
+    setTimeout(() => playTone(400 - i * 60, 0.35, 'sawtooth', 0.08), t);
+  });
+}
+
+function sndStart() {
+  ensureAudio();
+  [0, 80, 160].forEach((t, i) => {
+    setTimeout(() => playTone(440 + i * 110, 0.15, 'sine', 0.12), t);
+  });
+}
+
+function sndMatch() {
+  ensureAudio();
+  [0, 60, 120, 180].forEach((t, i) => {
+    setTimeout(() => playTone(660 + i * 120, 0.15, 'sine', 0.15), t);
+  });
+}
+
+function sndGoldenCatch() {
+  ensureAudio();
+  [0, 80, 160, 240].forEach((t, i) => {
+    setTimeout(() => playTone(880 + i * 180, 0.12, 'triangle', 0.15), t);
+  });
+}
+
+// ── State ──
+const State = { TITLE: 0, PLAYING: 1, GAMEOVER: 2 };
+let state = State.TITLE;
+let score, combo, maxCombo, misses, level, levelTimer, maxHearts;
+let punis, particles, popups, caughtPunis, platePunis, vanishingPunis;
+let plateX, plateTargetX;
+let spawnTimer, spawnInterval;
+let globalTime = 0;
+let blinkTimer = 0;
+let isBlinking = false;
+let titlePunis = [];
+
+const PLATE_W_RATIO = 5;
+const PUNI_R = 22;
+const PLATE_W = PUNI_R * 2 * PLATE_W_RATIO;
+const PLATE_H = 18;
+const PLATE_Y = H - 60;
+const BASE_MAX_HEARTS = 5;
+maxHearts = BASE_MAX_HEARTS;
+const MAX_COMBO_MULT = 5;
+
+// ── Colors ──
+const PUNI_COLORS = [
+  { name: 'いちご', body: [255, 80, 100], highlight: [255, 180, 190] },
+  { name: 'ラムネ',  body: [80, 150, 255], highlight: [180, 210, 255] },
+  { name: 'メロン',  body: [80, 200, 120], highlight: [180, 240, 200] },
+  { name: 'ゆず',   body: [240, 200, 60],  highlight: [255, 240, 160] },
+  { name: 'ぶどう',  body: [170, 100, 220], highlight: [220, 180, 255] },
+];
+const ROTTEN_COLOR = { name: '腐った', body: [100, 90, 50], highlight: [140, 130, 80] };
+const GOLDEN_COLOR = { name: '金色', body: [255, 210, 60], highlight: [255, 255, 220] };
+const GOLDEN_CHANCE = 0.04;
+
+// ── Input ──
+const keys = {};
+let mouseX = W / 2;
+let inputMode = 'mouse';
+
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  inputMode = 'key';
+  if ((e.code === 'Space' || e.code === 'Enter') && state !== State.PLAYING) {
+    ensureAudio();
+    startGame();
+  }
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = (e.clientX - rect.left) / rect.width * W;
+  inputMode = 'mouse';
+});
+canvas.addEventListener('click', () => {
+  ensureAudio();
+  if (state !== State.PLAYING) startGame();
+});
+
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  ensureAudio();
+  if (state !== State.PLAYING) { startGame(); return; }
+  const rect = canvas.getBoundingClientRect();
+  mouseX = (e.touches[0].clientX - rect.left) / rect.width * W;
+  inputMode = 'mouse';
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  mouseX = (e.touches[0].clientX - rect.left) / rect.width * W;
+  inputMode = 'mouse';
+}, { passive: false });
+
+// ── Game Init ──
+function startGame() {
+  if (state === State.PLAYING) return;
+  state = State.PLAYING;
+  score = 0; combo = 0; maxCombo = 0; misses = 0;
+  maxHearts = BASE_MAX_HEARTS;
+  level = 1; levelTimer = 0;
+  punis = []; particles = []; popups = []; caughtPunis = [];
+  platePunis = []; vanishingPunis = [];
+  plateX = W / 2; plateTargetX = W / 2;
+  spawnInterval = 1.2;
+  spawnTimer = 0.5;
+  sndStart();
+}
+
+// ── Puni Factory ──
+function spawnPuni() {
+  const margin = PUNI_R + 10;
+  const colorIdx = Math.random() * PUNI_COLORS.length | 0;
+  // Rotten chance: 12% base, up to ~25% at high levels
+  const rottenChance = 0.12 + Math.min(level - 1, 8) * 0.018;
+  const rotten = Math.random() < rottenChance;
+  const golden = !rotten && Math.random() < GOLDEN_CHANCE;
+  punis.push({
+    x: margin + Math.random() * (W - margin * 2),
+    y: -PUNI_R * 2,
+    color: colorIdx,
+    r: PUNI_R,
+    vy: 1.5 + level * 0.35,
+    wobblePhase: Math.random() * Math.PI * 2,
+    wobbleSpeed: 3 + Math.random() * 2,
+    alive: true,
+    rotten: rotten,
+    golden: golden,
+  });
+}
+
+// ── Particles ──
+function emitParticles(x, y, color, count) {
+  const c = PUNI_COLORS[color];
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 3;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 2,
+      r: 2 + Math.random() * 4,
+      life: 1,
+      decay: 0.02 + Math.random() * 0.02,
+      color: c.body,
+    });
+  }
+}
+
+function emitRottenParticles(x, y, count) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 3;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 2,
+      r: 2 + Math.random() * 4,
+      life: 1,
+      decay: 0.02 + Math.random() * 0.02,
+      color: [100, 90, 50],
+    });
+  }
+}
+
+function emitGoldenParticles(x, y, count) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 3;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 2,
+      r: 2 + Math.random() * 5,
+      life: 1,
+      decay: 0.015 + Math.random() * 0.02,
+      color: [255, 220, 120],
+    });
+  }
+}
+
+// ── Popups ──
+function addPopup(x, y, text, color) {
+  popups.push({ x, y, text, life: 1, color: color || '#fff' });
+}
+
+// ── Title Punis ──
+function initTitlePunis() {
+  titlePunis = [];
+  for (let i = 0; i < 8; i++) {
+    titlePunis.push({
+      x: 40 + Math.random() * (W - 80),
+      y: 200 + Math.random() * 400,
+      color: i % 5,
+      r: 18 + Math.random() * 10,
+      wobblePhase: Math.random() * Math.PI * 2,
+      vx: (Math.random() - 0.5) * 0.5,
+      vy: (Math.random() - 0.5) * 0.3,
+    });
+  }
+}
+initTitlePunis();
+
+// ── Drawing Helpers ──
+function drawPuni(x, y, r, colorIdx, wobblePhase, extraScale) {
+  const c = PUNI_COLORS[colorIdx];
+  const t = wobblePhase;
+  const sx = 1 + Math.sin(t) * 0.06;
+  const sy = 1 + Math.cos(t) * 0.06;
+  const scale = (extraScale || 1);
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(sx * scale, sy * scale);
+
+  // Body - multiple gradient layers for jelly look
+  // Outer glow
+  const g0 = ctx.createRadialGradient(0, 0, r * 0.2, 0, r * 0.15, r * 1.3);
+  g0.addColorStop(0, `rgba(${c.highlight.join(',')}, 0.25)`);
+  g0.addColorStop(1, `rgba(${c.body.join(',')}, 0)`);
+  ctx.fillStyle = g0;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, r * 1.3, r * 1.3, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Main body
+  const g1 = ctx.createRadialGradient(-r * 0.25, -r * 0.3, r * 0.1, 0, 0, r);
+  g1.addColorStop(0, `rgba(${c.highlight.join(',')}, 0.9)`);
+  g1.addColorStop(0.4, `rgba(${c.body.join(',')}, 0.7)`);
+  g1.addColorStop(1, `rgba(${c.body[0] * 0.7 | 0}, ${c.body[1] * 0.7 | 0}, ${c.body[2] * 0.7 | 0}, 0.5)`);
+  ctx.fillStyle = g1;
+  ctx.beginPath();
+  ctx.ellipse(0, r * 0.05, r, r * 0.95, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Inner highlight (top-left shine)
+  const g2 = ctx.createRadialGradient(-r * 0.3, -r * 0.35, 0, -r * 0.2, -r * 0.25, r * 0.55);
+  g2.addColorStop(0, `rgba(255, 255, 255, 0.6)`);
+  g2.addColorStop(1, `rgba(255, 255, 255, 0)`);
+  ctx.fillStyle = g2;
+  ctx.beginPath();
+  ctx.ellipse(-r * 0.2, -r * 0.2, r * 0.55, r * 0.45, -0.3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Eyes
+  const eyeSpacing = r * 0.32;
+  const eyeY = -r * 0.05;
+  const eyeR = r * 0.18;
+  const blinkScale = isBlinking ? 0.15 : 1;
+
+  // Left eye
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.ellipse(-eyeSpacing, eyeY, eyeR, eyeR * blinkScale, 0, 0, Math.PI * 2);
+  ctx.fill();
+  if (!isBlinking) {
+    ctx.fillStyle = '#2a2a3a';
+    ctx.beginPath();
+    ctx.ellipse(-eyeSpacing + 1, eyeY + 1, eyeR * 0.6, eyeR * 0.6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.ellipse(-eyeSpacing - 1, eyeY - 2, eyeR * 0.22, eyeR * 0.22, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Right eye
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.ellipse(eyeSpacing, eyeY, eyeR, eyeR * blinkScale, 0, 0, Math.PI * 2);
+  ctx.fill();
+  if (!isBlinking) {
+    ctx.fillStyle = '#2a2a3a';
+    ctx.beginPath();
+    ctx.ellipse(eyeSpacing + 1, eyeY + 1, eyeR * 0.6, eyeR * 0.6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.ellipse(eyeSpacing - 1, eyeY - 2, eyeR * 0.22, eyeR * 0.22, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Mouth - small smile
+  ctx.strokeStyle = `rgba(${c.body[0] * 0.5 | 0}, ${c.body[1] * 0.5 | 0}, ${c.body[2] * 0.5 | 0}, 0.6)`;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(0, eyeY + r * 0.3, r * 0.12, 0.1 * Math.PI, 0.9 * Math.PI);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawGoldenPuni(x, y, r, wobblePhase, extraScale) {
+  const c = GOLDEN_COLOR;
+  const t = wobblePhase;
+  const sx = 1 + Math.sin(t) * 0.08;
+  const sy = 1 + Math.cos(t) * 0.08;
+  const scale = (extraScale || 1);
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(sx * scale, sy * scale);
+
+  const glow = ctx.createRadialGradient(0, 0, r * 0.1, 0, 0, r * 1.4);
+  glow.addColorStop(0, 'rgba(255, 255, 200, 0.8)');
+  glow.addColorStop(1, 'rgba(255, 200, 80, 0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, r * 1.4, r * 1.4, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  const body = ctx.createRadialGradient(-r * 0.25, -r * 0.3, r * 0.2, 0, 0, r);
+  body.addColorStop(0, `rgba(${c.highlight.join(',')}, 1)`);
+  body.addColorStop(0.5, `rgba(${c.body.join(',')}, 0.85)`);
+  body.addColorStop(1, 'rgba(200, 120, 20, 0.6)');
+  ctx.fillStyle = body;
+  ctx.beginPath();
+  ctx.ellipse(0, r * 0.03, r * 1.05, r * 0.95, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  const sparkle = ctx.createRadialGradient(-r * 0.3, -r * 0.35, 0, -r * 0.1, -r * 0.2, r * 0.5);
+  sparkle.addColorStop(0, 'rgba(255, 255, 255, 0.9)');
+  sparkle.addColorStop(1, 'rgba(255, 255, 255, 0)');
+  ctx.fillStyle = sparkle;
+  ctx.beginPath();
+  ctx.ellipse(-r * 0.1, -r * 0.1, r * 0.6, r * 0.5, -0.2, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  const sparkleY = -r * 0.8;
+  ctx.moveTo(-r * 0.1, sparkleY);
+  ctx.lineTo(r * 0.1, sparkleY);
+  ctx.moveTo(0, sparkleY - r * 0.1);
+  ctx.lineTo(0, sparkleY + r * 0.1);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawRottenPuni(x, y, r, wobblePhase, extraScale) {
+  const c = ROTTEN_COLOR;
+  const t = wobblePhase;
+  const sx = 1 + Math.sin(t) * 0.06;
+  const sy = 1 + Math.cos(t) * 0.06;
+  const scale = (extraScale || 1);
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(sx * scale, sy * scale);
+
+  // Outer glow - sickly
+  const g0 = ctx.createRadialGradient(0, 0, r * 0.2, 0, r * 0.15, r * 1.3);
+  g0.addColorStop(0, `rgba(${c.highlight.join(',')}, 0.3)`);
+  g0.addColorStop(1, `rgba(${c.body.join(',')}, 0)`);
+  ctx.fillStyle = g0;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, r * 1.3, r * 1.3, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Main body - murky brownish-green
+  const g1 = ctx.createRadialGradient(-r * 0.25, -r * 0.3, r * 0.1, 0, 0, r);
+  g1.addColorStop(0, `rgba(${c.highlight.join(',')}, 0.85)`);
+  g1.addColorStop(0.4, `rgba(${c.body.join(',')}, 0.7)`);
+  g1.addColorStop(1, `rgba(60, 55, 30, 0.55)`);
+  ctx.fillStyle = g1;
+  ctx.beginPath();
+  ctx.ellipse(0, r * 0.05, r, r * 0.95, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Dim highlight - less shiny than normal
+  const g2 = ctx.createRadialGradient(-r * 0.3, -r * 0.35, 0, -r * 0.2, -r * 0.25, r * 0.55);
+  g2.addColorStop(0, `rgba(200, 200, 150, 0.3)`);
+  g2.addColorStop(1, `rgba(200, 200, 150, 0)`);
+  ctx.fillStyle = g2;
+  ctx.beginPath();
+  ctx.ellipse(-r * 0.2, -r * 0.2, r * 0.55, r * 0.45, -0.3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Spots (mold)
+  ctx.fillStyle = 'rgba(60, 80, 40, 0.35)';
+  ctx.beginPath(); ctx.arc(r * 0.35, r * 0.2, r * 0.12, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(-r * 0.4, r * 0.35, r * 0.09, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(r * 0.1, r * 0.45, r * 0.08, 0, Math.PI * 2); ctx.fill();
+
+  // ×× Eyes
+  const eyeSpacing = r * 0.32;
+  const eyeY = -r * 0.05;
+  const eyeR = r * 0.18;
+  ctx.strokeStyle = '#4a3a20';
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  // Left ×
+  ctx.beginPath();
+  ctx.moveTo(-eyeSpacing - eyeR * 0.6, eyeY - eyeR * 0.6);
+  ctx.lineTo(-eyeSpacing + eyeR * 0.6, eyeY + eyeR * 0.6);
+  ctx.moveTo(-eyeSpacing + eyeR * 0.6, eyeY - eyeR * 0.6);
+  ctx.lineTo(-eyeSpacing - eyeR * 0.6, eyeY + eyeR * 0.6);
+  ctx.stroke();
+  // Right ×
+  ctx.beginPath();
+  ctx.moveTo(eyeSpacing - eyeR * 0.6, eyeY - eyeR * 0.6);
+  ctx.lineTo(eyeSpacing + eyeR * 0.6, eyeY + eyeR * 0.6);
+  ctx.moveTo(eyeSpacing + eyeR * 0.6, eyeY - eyeR * 0.6);
+  ctx.lineTo(eyeSpacing - eyeR * 0.6, eyeY + eyeR * 0.6);
+  ctx.stroke();
+
+  // Wavy mouth (disgust)
+  ctx.strokeStyle = 'rgba(70, 50, 20, 0.6)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  const mouthY = eyeY + r * 0.35;
+  ctx.moveTo(-r * 0.18, mouthY);
+  ctx.quadraticCurveTo(-r * 0.09, mouthY - r * 0.06, 0, mouthY);
+  ctx.quadraticCurveTo(r * 0.09, mouthY + r * 0.06, r * 0.18, mouthY);
+  ctx.stroke();
+
+  // Stink lines
+  ctx.strokeStyle = 'rgba(100, 120, 50, 0.4)';
+  ctx.lineWidth = 1.2;
+  const stinkT = globalTime * 3;
+  for (let i = 0; i < 3; i++) {
+    const sx2 = -r * 0.5 + i * r * 0.5;
+    const baseY = -r * 0.9 - i * r * 0.15;
+    ctx.beginPath();
+    ctx.moveTo(sx2, baseY);
+    ctx.quadraticCurveTo(sx2 + Math.sin(stinkT + i) * 3, baseY - r * 0.25, sx2 - Math.sin(stinkT + i + 1) * 2, baseY - r * 0.5);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function drawPlate(x, y) {
+  ctx.save();
+  ctx.translate(x, y);
+
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(0, 8, PLATE_W / 2 + 4, PLATE_H / 2 + 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Plate body
+  const pg = ctx.createLinearGradient(0, -PLATE_H, 0, PLATE_H);
+  pg.addColorStop(0, '#f8f0e8');
+  pg.addColorStop(0.3, '#fff');
+  pg.addColorStop(0.7, '#e8ddd0');
+  pg.addColorStop(1, '#d4c8b8');
+  ctx.fillStyle = pg;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, PLATE_W / 2, PLATE_H / 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Rim highlight
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.ellipse(0, -1, PLATE_W / 2 - 3, PLATE_H / 2 - 2, 0, Math.PI * 1.1, Math.PI * 1.9);
+  ctx.stroke();
+
+  // Inner rim
+  ctx.strokeStyle = 'rgba(180,160,140,0.4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, PLATE_W / 2 - 12, PLATE_H / 2 - 4, 0, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Decorative dots on rim
+  ctx.fillStyle = 'rgba(180,140,120,0.3)';
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    const rx = (PLATE_W / 2 - 7) * Math.cos(a);
+    const ry = (PLATE_H / 2 - 2) * Math.sin(a);
+    ctx.beginPath();
+    ctx.arc(rx, ry, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+// ── Background ──
+function drawBackground() {
+  // Gradient sky
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#e8f4f8');
+  bg.addColorStop(0.5, '#d4eaf0');
+  bg.addColorStop(1, '#c0dce8');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Floating bubbles
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  for (let i = 0; i < 12; i++) {
+    const bx = ((i * 97 + globalTime * 0.2 * (0.5 + (i % 3) * 0.3)) % (W + 40)) - 20;
+    const by = ((i * 137 + globalTime * 0.15 * (0.3 + (i % 4) * 0.2)) % (H + 40)) - 20;
+    const br = 8 + (i % 5) * 6;
+    ctx.beginPath();
+    ctx.arc(bx, by, br, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ── HUD ──
+function drawHUD() {
+  // Score
+  ctx.fillStyle = '#2a3a5a';
+  ctx.font = 'bold 20px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('スコア: ' + score, 15, 32);
+
+  // Level
+  ctx.textAlign = 'right';
+  ctx.fillText('Lv.' + level, W - 15, 32);
+
+  // Combo
+  if (combo > 1) {
+    const comboMult = Math.min(combo, MAX_COMBO_MULT);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillStyle = '#e06030';
+    const pulse = 1 + Math.sin(globalTime * 8) * 0.05;
+    ctx.save();
+    ctx.translate(W / 2, 30);
+    ctx.scale(pulse, pulse);
+    ctx.fillText(combo + 'コンボ! ×' + comboMult, 0, 0);
+    ctx.restore();
+  }
+
+  // Lives
+  ctx.textAlign = 'left';
+  const remaining = Math.max(0, maxHearts - misses);
+  let lifeStr = '';
+  for (let i = 0; i < maxHearts; i++) {
+    lifeStr += i < remaining ? '♥' : '♡';
+  }
+  ctx.font = '22px sans-serif';
+  ctx.fillStyle = '#e05060';
+  ctx.fillText(lifeStr, 15, 60);
+}
+
+// ── Title Screen ──
+function drawTitle() {
+  drawBackground();
+
+  // Animate title punis
+  titlePunis.forEach(p => {
+    p.x += p.vx;
+    p.y += p.vy;
+    if (p.x < p.r || p.x > W - p.r) p.vx *= -1;
+    if (p.y < 180 || p.y > H - 80) p.vy *= -1;
+    p.wobblePhase += 0.05;
+    drawPuni(p.x, p.y, p.r, p.color, p.wobblePhase, 0.8);
+  });
+
+  // Title overlay
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.fillRect(0, 100, W, 280);
+
+  // Title text
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e06080';
+  ctx.font = 'bold 64px sans-serif';
+  ctx.fillText('ぷにぷに', W / 2, 200);
+
+  // Subtitle
+  ctx.fillStyle = '#6a8ab0';
+  ctx.font = '20px sans-serif';
+  ctx.fillText('〜水まんじゅうキャッチゲーム〜', W / 2, 245);
+
+  // Instructions
+  ctx.fillStyle = '#8090a0';
+  ctx.font = '16px sans-serif';
+  ctx.fillText('マウス / タッチ / 矢印キー で皿を動かそう', W / 2, 290);
+  ctx.fillText('降ってくる水まんじゅうをキャッチ！', W / 2, 313);
+  ctx.fillStyle = '#5080b0';
+  ctx.fillText('同じ色が3つ揃うと消えてボーナス +50点！', W / 2, 340);
+  ctx.fillStyle = '#a08060';
+  ctx.fillText('⚠ 腐った水まんじゅうに注意！受け止めると♥が減る', W / 2, 365);
+  ctx.fillStyle = '#d4a419';
+  ctx.fillText('✨ 金色の水まんじゅうでハート回復＆最大♥アップ！', W / 2, 390);
+
+  // Start prompt (blinking)
+  if (Math.sin(globalTime * 3) > -0.3) {
+    ctx.fillStyle = '#e06080';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('クリック / タップ / スペースキーでスタート', W / 2, 420);
+  }
+}
+
+// ── Game Over Screen ──
+function drawGameOver() {
+  drawBackground();
+
+  // Dim overlay
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Panel
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  const pw = 340, ph = 300;
+  const px = (W - pw) / 2, py = (H - ph) / 2 - 20;
+  ctx.beginPath();
+  ctx.roundRect(px, py, pw, ph, 16);
+  ctx.fill();
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#d04060';
+  ctx.font = 'bold 36px sans-serif';
+  ctx.fillText('ゲームオーバー', W / 2, py + 60);
+
+  ctx.fillStyle = '#4a5a7a';
+  ctx.font = '22px sans-serif';
+  ctx.fillText('スコア: ' + score, W / 2, py + 120);
+  ctx.fillText('最大コンボ: ' + maxCombo, W / 2, py + 155);
+  ctx.fillText('レベル: ' + level, W / 2, py + 190);
+
+  if (Math.sin(globalTime * 3) > -0.3) {
+    ctx.fillStyle = '#e06080';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText('クリック / タップ / スペースで リトライ', W / 2, py + 255);
+  }
+}
+
+// ── Plate Puni Layout ──
+const PLATE_PUNI_MAX = 8;
+const PLATE_PUNI_SMALL = 0.65; // scale when on plate
+
+function getPlatePuniPos(index, total) {
+  // Spread punis evenly across the plate width
+  const spacing = Math.min(PUNI_R * 2 * PLATE_PUNI_SMALL + 4, (PLATE_W - 20) / Math.max(total, 1));
+  const totalW = spacing * (total - 1);
+  const startX = -totalW / 2;
+  return { x: startX + index * spacing, y: -PUNI_R * PLATE_PUNI_SMALL * 0.7 };
+}
+
+// ── Match Check ──
+function checkMatch() {
+  // Count colors on plate
+  const counts = {};
+  for (const pp of platePunis) {
+    counts[pp.color] = (counts[pp.color] || 0) + 1;
+  }
+  // Find any color with 3+
+  for (const colorStr in counts) {
+    if (counts[colorStr] >= 3) {
+      const colorIdx = parseInt(colorStr);
+      // Collect positions for vanish effect before removing
+      const total = platePunis.length;
+      const matched = [];
+      const remaining = [];
+      for (let i = 0; i < platePunis.length; i++) {
+        if (platePunis[i].color === colorIdx && matched.length < 3) {
+          matched.push(i);
+        } else {
+          remaining.push(platePunis[i]);
+        }
+      }
+      // Vanish animation for matched
+      for (const idx of matched) {
+        const pos = getPlatePuniPos(idx, total);
+        vanishingPunis.push({
+          x: plateX + pos.x, y: PLATE_Y + pos.y,
+          color: colorIdx, r: PUNI_R, t: 0,
+        });
+        emitParticles(plateX + pos.x, PLATE_Y + pos.y, colorIdx, 8);
+      }
+      platePunis = remaining;
+      score += 50;
+      addPopup(plateX, PLATE_Y - 40, '3つ揃い! +50', PUNI_COLORS[colorIdx].highlight.join(','));
+      sndMatch();
+      // Re-check in case of chain (e.g. 6 of same color)
+      checkMatch();
+      return;
+    }
+  }
+}
+
+// ── Update ──
+const FIXED_DT = 1 / 60;
+
+function update(dt) {
+  globalTime += dt;
+
+  // Blink timer
+  blinkTimer -= dt;
+  if (blinkTimer <= 0) {
+    if (isBlinking) {
+      isBlinking = false;
+      blinkTimer = 2.5 + Math.random() * 3;
+    } else {
+      isBlinking = true;
+      blinkTimer = 0.12;
+    }
+  }
+
+  if (state !== State.PLAYING) return;
+
+  // ── Plate movement ──
+  const PLATE_SPEED = 8;
+  if (inputMode === 'key') {
+    if (keys['ArrowLeft'] || keys['KeyA']) plateTargetX -= PLATE_SPEED;
+    if (keys['ArrowRight'] || keys['KeyD']) plateTargetX += PLATE_SPEED;
+  } else {
+    plateTargetX = mouseX;
+  }
+  plateTargetX = Math.max(PLATE_W / 2, Math.min(W - PLATE_W / 2, plateTargetX));
+  plateX += (plateTargetX - plateX) * 0.18;
+
+  // ── Level up ──
+  levelTimer += dt;
+  if (levelTimer >= 15) {
+    levelTimer -= 15;
+    level++;
+    spawnInterval = Math.max(0.35, 1.2 - (level - 1) * 0.1);
+  }
+
+  // ── Spawn ──
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnTimer = spawnInterval * (0.7 + Math.random() * 0.6);
+    spawnPuni();
+  }
+
+  // ── Update punis ──
+  for (let i = punis.length - 1; i >= 0; i--) {
+    const p = punis[i];
+    p.y += p.vy;
+    p.wobblePhase += p.wobbleSpeed * dt;
+
+    // Check catch
+    const dy = p.y - PLATE_Y;
+    const dx = p.x - plateX;
+    if (dy > -p.r * 0.5 && dy < p.r * 1.2 && Math.abs(dx) < PLATE_W / 2 + p.r * 0.3) {
+      p.alive = false;
+      if (p.golden) {
+        const recovered = misses > 0;
+        if (recovered) {
+          misses = Math.max(0, misses - 1);
+          addPopup(p.x, p.y - 20, '♥ +1', '255,220,120');
+        } else {
+          maxHearts++;
+          addPopup(p.x, p.y - 20, '最大♥ +1', '255,220,120');
+        }
+        emitGoldenParticles(p.x, p.y, 16);
+        sndGoldenCatch();
+      } else if (p.rotten) {
+        // Caught rotten puni — lose a heart!
+        combo = 0;
+        misses++;
+        addPopup(p.x, p.y - 20, 'ゲッ！-♥', '180,80,80');
+        emitRottenParticles(p.x, p.y, 10);
+        caughtPunis.push({
+          x: p.x, y: PLATE_Y, color: p.color, r: p.r,
+          wobblePhase: p.wobblePhase,
+          bounceT: 0, bounceVy: -4, bounceY: 0,
+          rotten: true,
+        });
+        sndRottenCatch();
+        if (misses >= maxHearts) {
+          state = State.GAMEOVER;
+          sndGameOver();
+        }
+      } else {
+        // Caught good puni
+        combo++;
+        if (combo > maxCombo) maxCombo = combo;
+        const mult = Math.min(combo, MAX_COMBO_MULT);
+        const pts = 10 * mult;
+        score += pts;
+        addPopup(p.x, p.y - 20, '+' + pts, PUNI_COLORS[p.color].highlight.join(','));
+        emitParticles(p.x, p.y, p.color, 12);
+        caughtPunis.push({
+          x: p.x, y: PLATE_Y, color: p.color, r: p.r,
+          wobblePhase: p.wobblePhase,
+          bounceT: 0, bounceVy: -4, bounceY: 0,
+          rotten: false,
+        });
+        sndCatch(combo);
+      }
+    }
+
+    // Check miss (fell off screen)
+    if (p.y > H + p.r * 2) {
+      p.alive = false;
+      if (!p.rotten) {
+        // Only normal punis count as miss when dropped
+        combo = 0;
+        misses++;
+        sndMiss();
+        if (misses >= maxHearts) {
+          state = State.GAMEOVER;
+          sndGameOver();
+        }
+      }
+    }
+  }
+  punis = punis.filter(p => p.alive);
+
+  // ── Update caught punis (bounce animation) ──
+  for (let i = caughtPunis.length - 1; i >= 0; i--) {
+    const cp = caughtPunis[i];
+    cp.bounceT += dt;
+    cp.bounceVy += 12 * dt;
+    cp.bounceY += cp.bounceVy;
+    if (cp.bounceY > 0) {
+      cp.bounceY = 0;
+      cp.bounceVy *= -0.5;
+      if (Math.abs(cp.bounceVy) < 0.5) cp.bounceVy = 0;
+    }
+    cp.wobblePhase += 5 * dt;
+    if (cp.bounceT > 0.5) {
+      // Settle onto plate (normal punis only; rotten just vanish)
+      if (!cp.rotten) {
+        platePunis.push({
+          color: cp.color,
+          wobblePhase: cp.wobblePhase,
+          r: cp.r,
+        });
+        checkMatch();
+        // Overflow: if too many on plate, oldest falls off
+        while (platePunis.length > PLATE_PUNI_MAX) {
+          const dropped = platePunis.shift();
+          combo = 0;
+          addPopup(plateX, PLATE_Y + 20, 'おちた！', '200,100,100');
+        }
+      }
+      caughtPunis.splice(i, 1);
+    }
+  }
+
+  // ── Update plate punis (wobble + follow plate) ──
+  for (const pp of platePunis) {
+    pp.wobblePhase += 3 * dt;
+  }
+
+  // ── Update vanishing punis ──
+  for (let i = vanishingPunis.length - 1; i >= 0; i--) {
+    const vp = vanishingPunis[i];
+    vp.t += dt;
+    if (vp.t > 0.5) vanishingPunis.splice(i, 1);
+  }
+
+  // ── Update particles ──
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.08;
+    p.life -= p.decay;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  // ── Update popups ──
+  for (let i = popups.length - 1; i >= 0; i--) {
+    const p = popups[i];
+    p.y -= 1.2;
+    p.life -= 0.025;
+    if (p.life <= 0) popups.splice(i, 1);
+  }
+}
+
+// ── Render ──
+function render() {
+  ctx.clearRect(0, 0, W, H);
+
+  if (state === State.TITLE) {
+    drawTitle();
+    return;
+  }
+
+  drawBackground();
+
+  // Falling punis
+  punis.forEach(p => {
+    if (p.golden) {
+      drawGoldenPuni(p.x, p.y, p.r, p.wobblePhase);
+    } else if (p.rotten) {
+      drawRottenPuni(p.x, p.y, p.r, p.wobblePhase);
+    } else {
+      drawPuni(p.x, p.y, p.r, p.color, p.wobblePhase);
+    }
+  });
+
+  // Plate
+  drawPlate(plateX, PLATE_Y);
+
+  // Punis sitting on plate
+  if (platePunis) {
+    const total = platePunis.length;
+    platePunis.forEach((pp, idx) => {
+      const pos = getPlatePuniPos(idx, total);
+      drawPuni(plateX + pos.x, PLATE_Y + pos.y, pp.r, pp.color, pp.wobblePhase, PLATE_PUNI_SMALL);
+    });
+  }
+
+  // Vanishing punis (match animation)
+  if (vanishingPunis) {
+    vanishingPunis.forEach(vp => {
+      const progress = vp.t / 0.5;
+      ctx.globalAlpha = 1 - progress;
+      const s = PLATE_PUNI_SMALL * (1 + progress * 0.5);
+      drawPuni(vp.x, vp.y - progress * 30, vp.r, vp.color, globalTime * 8, s);
+      ctx.globalAlpha = 1;
+    });
+  }
+
+  // Caught punis bouncing (in-flight animation)
+  caughtPunis.forEach(cp => {
+    const alpha = Math.max(0, 1 - cp.bounceT / 0.5);
+    ctx.globalAlpha = alpha;
+    const scale = 1 + Math.sin(cp.bounceT * 20) * 0.1 * (1 - cp.bounceT);
+    if (cp.rotten) {
+      drawRottenPuni(cp.x, cp.y + cp.bounceY - cp.r, cp.r, cp.wobblePhase, scale);
+    } else {
+      drawPuni(cp.x, cp.y + cp.bounceY - cp.r, cp.r, cp.color, cp.wobblePhase, scale);
+    }
+    ctx.globalAlpha = 1;
+  });
+
+  // Particles
+  particles.forEach(p => {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = `rgba(${p.color.join(',')}, ${p.life})`;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  // Popups
+  popups.forEach(p => {
+    ctx.globalAlpha = p.life;
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.fillStyle = `rgba(${p.color}, ${p.life})`;
+    ctx.strokeStyle = `rgba(255,255,255,${p.life * 0.8})`;
+    ctx.lineWidth = 3;
+    ctx.strokeText(p.text, p.x, p.y);
+    ctx.fillText(p.text, p.x, p.y);
+  });
+  ctx.globalAlpha = 1;
+
+  // HUD
+  drawHUD();
+
+  if (state === State.GAMEOVER) {
+    drawGameOver();
+  }
+}
+
+// ── Main Loop ──
+let lastTime = 0;
+let accumulator = 0;
+
+function loop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
+  lastTime = timestamp;
+  accumulator += dt;
+
+  while (accumulator >= FIXED_DT) {
+    update(FIXED_DT);
+    accumulator -= FIXED_DT;
+  }
+
+  render();
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(ts => {
+  lastTime = ts;
+  requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
