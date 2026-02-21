@@ -115,7 +115,7 @@ function sndGoldenCatch() {
 // ── State ──
 const State = { TITLE: 0, PLAYING: 1, GAMEOVER: 2 };
 let state = State.TITLE;
-let score, combo, maxCombo, misses, level, levelTimer, maxHearts;
+let score, combo, maxCombo, misses, level, levelTimer, maxHearts, nextGoldenScore;
 let punis, particles, popups, caughtPunis, platePunis, vanishingPunis;
 let plateX, plateTargetX;
 let spawnTimer, spawnInterval;
@@ -197,6 +197,7 @@ function startGame() {
   plateX = W / 2; plateTargetX = W / 2;
   spawnInterval = 1.2;
   spawnTimer = 0.5;
+  nextGoldenScore = 5000;
   sndStart();
 }
 
@@ -269,6 +270,31 @@ function emitGoldenParticles(x, y, count) {
       decay: 0.015 + Math.random() * 0.02,
       color: [255, 220, 120],
     });
+  }
+}
+
+function applyGoldenReward(x, y, extraText) {
+  const px = x !== undefined ? x : plateX;
+  const py = y !== undefined ? y : PLATE_Y;
+  const recovered = misses > 0;
+  if (recovered) {
+    misses = Math.max(0, misses - 1);
+    addPopup(px, py - 20, '♥ +1', '255,220,120');
+  } else {
+    maxHearts++;
+    addPopup(px, py - 20, '最大♥ +1', '255,220,120');
+  }
+  if (extraText) {
+    addPopup(px, py - 60, extraText, '255,240,200');
+  }
+  emitGoldenParticles(px, py, 16);
+  sndGoldenCatch();
+}
+
+function checkScoreMilestone() {
+  while (state === State.PLAYING && nextGoldenScore && score >= nextGoldenScore) {
+    applyGoldenReward(plateX, PLATE_Y, `${nextGoldenScore}点ボーナス！`);
+    nextGoldenScore += 5000;
   }
 }
 
@@ -721,12 +747,44 @@ function drawGameOver() {
 const PLATE_PUNI_MAX = 8;
 const PLATE_PUNI_SMALL = 0.65; // scale when on plate
 
-function getPlatePuniPos(index, total) {
-  // Spread punis evenly across the plate width
-  const spacing = Math.min(PUNI_R * 2 * PLATE_PUNI_SMALL + 4, (PLATE_W - 20) / Math.max(total, 1));
-  const totalW = spacing * (total - 1);
-  const startX = -totalW / 2;
-  return { x: startX + index * spacing, y: -PUNI_R * PLATE_PUNI_SMALL * 0.7 };
+function getPlatePuniLayout(list) {
+  const punisList = list || platePunis;
+  const layout = new Array(punisList.length);
+  if (!punisList.length) return layout;
+
+  // Keep column order by the first appearance of each color
+  const colorOrder = [];
+  const colorToColumn = {};
+  for (let i = 0; i < punisList.length; i++) {
+    const color = punisList[i].color;
+    if (colorToColumn[color] === undefined) {
+      colorToColumn[color] = colorOrder.length;
+      colorOrder.push(color);
+    }
+  }
+
+  const columnCount = colorOrder.length;
+  const minSpacing = PUNI_R * 2 * PLATE_PUNI_SMALL + 6;
+  const spacing = columnCount > 1
+    ? Math.min(minSpacing, (PLATE_W - 40) / (columnCount - 1))
+    : 0;
+  const totalWidth = spacing * (columnCount - 1);
+  const startX = -totalWidth / 2;
+  const baseY = -PUNI_R * PLATE_PUNI_SMALL * 0.7;
+  const stackSpacing = PUNI_R * PLATE_PUNI_SMALL * 1.2;
+  const stacks = {};
+
+  for (let i = 0; i < punisList.length; i++) {
+    const color = punisList[i].color;
+    const columnIdx = colorToColumn[color];
+    const stackIdx = stacks[color] || 0;
+    layout[i] = {
+      x: startX + columnIdx * spacing,
+      y: baseY - stackIdx * stackSpacing,
+    };
+    stacks[color] = stackIdx + 1;
+  }
+  return layout;
 }
 
 // ── Match Check ──
@@ -741,7 +799,7 @@ function checkMatch() {
     if (counts[colorStr] >= 3) {
       const colorIdx = parseInt(colorStr);
       // Collect positions for vanish effect before removing
-      const total = platePunis.length;
+      const layout = getPlatePuniLayout();
       const matched = [];
       const remaining = [];
       for (let i = 0; i < platePunis.length; i++) {
@@ -753,7 +811,7 @@ function checkMatch() {
       }
       // Vanish animation for matched
       for (const idx of matched) {
-        const pos = getPlatePuniPos(idx, total);
+        const pos = layout[idx] || { x: 0, y: 0 };
         vanishingPunis.push({
           x: plateX + pos.x, y: PLATE_Y + pos.y,
           color: colorIdx, r: PUNI_R, t: 0,
@@ -763,6 +821,7 @@ function checkMatch() {
       platePunis = remaining;
       score += 50;
       addPopup(plateX, PLATE_Y - 40, '3つ揃い! +50', PUNI_COLORS[colorIdx].highlight.join(','));
+      checkScoreMilestone();
       sndMatch();
       // Re-check in case of chain (e.g. 6 of same color)
       checkMatch();
@@ -829,16 +888,7 @@ function update(dt) {
     if (dy > -p.r * 0.5 && dy < p.r * 1.2 && Math.abs(dx) < PLATE_W / 2 + p.r * 0.3) {
       p.alive = false;
       if (p.golden) {
-        const recovered = misses > 0;
-        if (recovered) {
-          misses = Math.max(0, misses - 1);
-          addPopup(p.x, p.y - 20, '♥ +1', '255,220,120');
-        } else {
-          maxHearts++;
-          addPopup(p.x, p.y - 20, '最大♥ +1', '255,220,120');
-        }
-        emitGoldenParticles(p.x, p.y, 16);
-        sndGoldenCatch();
+        applyGoldenReward(p.x, p.y);
       } else if (p.rotten) {
         // Caught rotten puni — lose a heart!
         combo = 0;
@@ -864,6 +914,7 @@ function update(dt) {
         const pts = 10 * mult;
         score += pts;
         addPopup(p.x, p.y - 20, '+' + pts, PUNI_COLORS[p.color].highlight.join(','));
+        checkScoreMilestone();
         emitParticles(p.x, p.y, p.color, 12);
         caughtPunis.push({
           x: p.x, y: PLATE_Y, color: p.color, r: p.r,
@@ -982,9 +1033,10 @@ function render() {
 
   // Punis sitting on plate
   if (platePunis) {
-    const total = platePunis.length;
+    const layout = getPlatePuniLayout();
     platePunis.forEach((pp, idx) => {
-      const pos = getPlatePuniPos(idx, total);
+      const pos = layout[idx];
+      if (!pos) return;
       drawPuni(plateX + pos.x, PLATE_Y + pos.y, pp.r, pp.color, pp.wobblePhase, PLATE_PUNI_SMALL);
     });
   }
